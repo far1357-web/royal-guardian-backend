@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+royal_guardian.db
+.env
+main.py
