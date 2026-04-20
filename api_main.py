@@ -18,6 +18,7 @@ PROOF_CORE_VERSION = "v36c-proof-core-lite-1"
 EXECUTION_INTEGRITY_VERSION = "v36c-execution-integrity-lite-1"
 DAILY_LIFECYCLE_VERSION = "v36c-daily-lifecycle-lite-1"
 REVIEW_APPEAL_VERSION = "v36c-review-appeal-lite-1"
+DASHBOARD_TIMELINE_VERSION = "v36c-dashboard-timeline-lite-1"
 
 VALID_PROOF_TYPE_MAP = {
     "text": "text",
@@ -46,7 +47,7 @@ AMBIGUOUS_PREFIXES = (
 
 app = FastAPI(
     title="Royal Guardian Backend",
-    version="0.9.0-review-appeal-v1"
+    version="0.10.1-dashboard-timeline-v1"
 )
 
 app.add_middleware(
@@ -869,7 +870,7 @@ def root():
         "status": "ok",
         "message": "Royal Guardian backend is running",
         "database": DB_PATH,
-        "version": "0.9.0-review-appeal-v1"
+        "version": "0.10.1-dashboard-timeline-v1"
     }
 
 
@@ -880,7 +881,7 @@ def health():
         "time": now_iso(),
         "database": DB_PATH,
         "bot_token_configured": bool(BOT_TOKEN),
-        "version": "0.9.0-review-appeal-v1"
+        "version": "0.10.1-dashboard-timeline-v1"
     }
 
 
@@ -1702,6 +1703,302 @@ def proofs_history(telegram_id: str, limit: int = 20):
 
 
 
+
+
+
+def event_label_fa(event_type: str) -> str:
+    return {
+        "proof_submitted": "اثبات پذیرفته شد",
+        "proof_needs_review": "اثبات وارد صف بررسی شد",
+        "duplicate_proof_blocked": "ثبت تکراری نامعتبر بود",
+        "review_accepted": "اثبات پس از بررسی پذیرفته شد",
+        "review_rejected": "اثبات رد شد",
+        "review_needs_revision": "اثبات نیازمند اصلاح شد",
+        "appeal_created": "اعتراض ثبت شد",
+        "appeal_accepted": "اعتراض پذیرفته شد",
+        "appeal_denied": "اعتراض رد شد",
+        "contract_created": "قرارداد ثبت شد",
+    }.get(event_type or "", event_type or "رویداد")
+
+
+def build_next_action(lifecycle: Dict[str, Any], latest_proof=None, open_appeal=None) -> Dict[str, Any]:
+    latest_proof_dict = row_to_dict(latest_proof)
+    open_appeal_dict = row_to_dict(open_appeal)
+
+    if open_appeal_dict:
+        return {
+            "code": "appeal_pending",
+            "title": "اعتراض در انتظار بررسی است",
+            "description": "فعلاً اقدام جدید لازم نیست؛ نتیجه اعتراض بعداً مشخص می‌شود.",
+            "primary_action": "wait_for_appeal_review"
+        }
+
+    if latest_proof_dict and latest_proof_dict.get("review_status") == "needs_review":
+        return {
+            "code": "proof_pending_review",
+            "title": "اثبات در صف بررسی است",
+            "description": "اثبات ثبت شده و منتظر تصمیم reviewer است.",
+            "primary_action": "wait_for_review"
+        }
+
+    if lifecycle.get("state") == "completed":
+        return {
+            "code": "create_new_contract",
+            "title": "قرارداد تازه بساز",
+            "description": "قرارداد قبلی کامل شده است. برای اجرای بعدی یک قرارداد تازه ثبت کن.",
+            "primary_action": "create_contract"
+        }
+
+    if lifecycle.get("can_submit_proof"):
+        return {
+            "code": "submit_proof",
+            "title": "اثبات قرارداد را ثبت کن",
+            "description": "قرارداد فعال است و هنوز اثبات معتبر ثبت نشده است.",
+            "primary_action": "submit_proof"
+        }
+
+    return {
+        "code": "create_contract",
+        "title": "قرارداد اجرایی بساز",
+        "description": "برای شروع اجرا، یک قرارداد مشخص و قابل اثبات ثبت کن.",
+        "primary_action": "create_contract"
+    }
+
+
+def get_user_dashboard_data(telegram_id: str) -> Dict[str, Any]:
+    with get_db() as conn:
+        user = conn.execute(
+            "SELECT * FROM users WHERE telegram_id = ?",
+            (telegram_id,)
+        ).fetchone()
+
+        latest_task = conn.execute(
+            """
+            SELECT * FROM tasks
+            WHERE telegram_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (telegram_id,)
+        ).fetchone()
+
+        active_task = conn.execute(
+            """
+            SELECT * FROM tasks
+            WHERE telegram_id = ? AND status = 'active'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (telegram_id,)
+        ).fetchone()
+
+        latest_proof = conn.execute(
+            """
+            SELECT * FROM proofs
+            WHERE telegram_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (telegram_id,)
+        ).fetchone()
+
+        open_appeal = conn.execute(
+            """
+            SELECT * FROM proof_appeals
+            WHERE telegram_id = ? AND status = 'open'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (telegram_id,)
+        ).fetchone()
+
+        lifecycle = build_task_lifecycle(conn, active_task or latest_task)
+
+        contract_counts = {
+            row["status"]: row["count"]
+            for row in conn.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM tasks
+                WHERE telegram_id = ?
+                GROUP BY status
+                """,
+                (telegram_id,)
+            ).fetchall()
+        }
+
+        proof_counts = {
+            row["review_status"]: row["count"]
+            for row in conn.execute(
+                """
+                SELECT review_status, COUNT(*) AS count
+                FROM proofs
+                WHERE telegram_id = ?
+                GROUP BY review_status
+                """,
+                (telegram_id,)
+            ).fetchall()
+        }
+
+        totals = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total_proofs,
+                COALESCE(SUM(xp_awarded), 0) AS total_xp_from_proofs,
+                COALESCE(AVG(proof_quality_score), 0) AS avg_proof_quality
+            FROM proofs
+            WHERE telegram_id = ?
+            """,
+            (telegram_id,)
+        ).fetchone()
+
+        appeal_counts = {
+            row["status"]: row["count"]
+            for row in conn.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM proof_appeals
+                WHERE telegram_id = ?
+                GROUP BY status
+                """,
+                (telegram_id,)
+            ).fetchall()
+        }
+
+    return {
+        "dashboard_version": DASHBOARD_TIMELINE_VERSION,
+        "user": row_to_dict(user),
+        "active_contract": row_to_dict(active_task),
+        "latest_contract": row_to_dict(latest_task),
+        "latest_proof": row_to_dict(latest_proof),
+        "open_appeal": row_to_dict(open_appeal),
+        "lifecycle": lifecycle,
+        "next_action": build_next_action(lifecycle, latest_proof, open_appeal),
+        "stats": {
+            "contracts": contract_counts,
+            "proofs": proof_counts,
+            "appeals": appeal_counts,
+            "total_proofs": totals["total_proofs"] if totals else 0,
+            "total_xp_from_proofs": totals["total_xp_from_proofs"] if totals else 0,
+            "avg_proof_quality": round(float(totals["avg_proof_quality"] or 0), 2) if totals else 0,
+        }
+    }
+
+
+@app.get("/me/dashboard")
+def me_dashboard(telegram_id: str):
+    telegram_id = telegram_id.strip()
+    if not telegram_id:
+        raise HTTPException(status_code=400, detail="شناسه تلگرام الزامی است")
+
+    return {
+        "ok": True,
+        **get_user_dashboard_data(telegram_id)
+    }
+
+
+@app.get("/me/next-action")
+def me_next_action(telegram_id: str):
+    telegram_id = telegram_id.strip()
+    if not telegram_id:
+        raise HTTPException(status_code=400, detail="شناسه تلگرام الزامی است")
+
+    data = get_user_dashboard_data(telegram_id)
+    return {
+        "ok": True,
+        "dashboard_version": DASHBOARD_TIMELINE_VERSION,
+        "next_action": data["next_action"],
+        "lifecycle": data["lifecycle"]
+    }
+
+
+@app.get("/me/timeline")
+def me_timeline(telegram_id: str, limit: int = 30):
+    telegram_id = telegram_id.strip()
+    if not telegram_id:
+        raise HTTPException(status_code=400, detail="شناسه تلگرام الزامی است")
+
+    limit = max(1, min(int(limit or 30), 100))
+
+    with get_db() as conn:
+        events = conn.execute(
+            """
+            SELECT * FROM progression_events
+            WHERE telegram_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (telegram_id, limit)
+        ).fetchall()
+
+    timeline = []
+    for row in events:
+        item = row_to_dict(row)
+        item["label"] = event_label_fa(item.get("event_type"))
+        timeline.append(item)
+
+    return {
+        "ok": True,
+        "dashboard_version": DASHBOARD_TIMELINE_VERSION,
+        "timeline": timeline
+    }
+
+
+@app.get("/me/history")
+def me_history(telegram_id: str, limit: int = 20):
+    telegram_id = telegram_id.strip()
+    if not telegram_id:
+        raise HTTPException(status_code=400, detail="شناسه تلگرام الزامی است")
+
+    limit = max(1, min(int(limit or 20), 100))
+
+    with get_db() as conn:
+        contracts = [
+            row_to_dict(row)
+            for row in conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE telegram_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (telegram_id, limit)
+            ).fetchall()
+        ]
+
+        proofs = [
+            row_to_dict(row)
+            for row in conn.execute(
+                """
+                SELECT * FROM proofs
+                WHERE telegram_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (telegram_id, limit)
+            ).fetchall()
+        ]
+
+        appeals = [
+            row_to_dict(row)
+            for row in conn.execute(
+                """
+                SELECT * FROM proof_appeals
+                WHERE telegram_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (telegram_id, limit)
+            ).fetchall()
+        ]
+
+    return {
+        "ok": True,
+        "dashboard_version": DASHBOARD_TIMELINE_VERSION,
+        "contracts": contracts,
+        "proofs": proofs,
+        "appeals": appeals
+    }
 
 
 @app.get("/review/queue")
