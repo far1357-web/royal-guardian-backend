@@ -15,6 +15,7 @@ DB_PATH = "royal_guardian.db"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 V36C_VALIDATION_VERSION = "v36c-contract-validation-lite-1"
 PROOF_CORE_VERSION = "v36c-proof-core-lite-1"
+EXECUTION_INTEGRITY_VERSION = "v36c-execution-integrity-lite-1"
 
 VALID_PROOF_TYPE_MAP = {
     "text": "text",
@@ -43,7 +44,7 @@ AMBIGUOUS_PREFIXES = (
 
 app = FastAPI(
     title="Royal Guardian Backend",
-    version="0.6.0-proof-core-v1"
+    version="0.7.0-execution-integrity-v1"
 )
 
 app.add_middleware(
@@ -412,6 +413,7 @@ def review_status_label_fa(status: str) -> str:
     return {
         "auto_accepted": "پذیرفته‌شده خودکار",
         "needs_review": "نیازمند بررسی",
+        "duplicate_submission": "تکراری؛ امتیاز دوباره ثبت نشد",
         "rejected": "رد شده",
     }.get(str(status), "نامشخص")
 
@@ -513,6 +515,13 @@ def init_db():
         ensure_column(conn, "proofs", "proof_validation_version", "TEXT")
         ensure_column(conn, "proofs", "detected_links", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "proofs", "word_count", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "proofs", "integrity_flag", "TEXT NOT NULL DEFAULT 'first_submission'")
+        ensure_column(conn, "proofs", "duplicate_of_proof_id", "INTEGER")
+        ensure_column(conn, "proofs", "integrity_version", "TEXT")
+        ensure_column(conn, "tasks", "submitted_at", "TEXT")
+        ensure_column(conn, "tasks", "completed_at", "TEXT")
+        ensure_column(conn, "tasks", "integrity_status", "TEXT NOT NULL DEFAULT 'open'")
+        ensure_column(conn, "tasks", "proof_attempts_count", "INTEGER NOT NULL DEFAULT 0")
 
         conn.commit()
 
@@ -556,7 +565,7 @@ def root():
         "status": "ok",
         "message": "Royal Guardian backend is running",
         "database": DB_PATH,
-        "version": "0.6.0-proof-core-v1"
+        "version": "0.7.0-execution-integrity-v1"
     }
 
 
@@ -567,7 +576,7 @@ def health():
         "time": now_iso(),
         "database": DB_PATH,
         "bot_token_configured": bool(BOT_TOKEN),
-        "version": "0.6.0-proof-core-v1"
+        "version": "0.7.0-execution-integrity-v1"
     }
 
 
@@ -792,6 +801,17 @@ def get_today(telegram_id: str):
         ).fetchone()
 
         if task is None:
+            task = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE telegram_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (telegram_id,)
+            ).fetchone()
+
+        if task is None:
             created = now_iso()
             cursor = conn.execute(
                 """
@@ -915,39 +935,15 @@ def create_proof(data: ProofCreateRequest):
 
         created = now_iso()
 
-        proof_validation = evaluate_proof_quality(proof_text, task)
-        xp_awarded = proof_validation["xp_awarded"]
-
-        cursor = conn.execute(
+        existing_proof = conn.execute(
             """
-            INSERT INTO proofs (
-                telegram_id, task_id, proof_text, status, created_at,
-                review_status, quality_note, xp_awarded,
-                proof_kind, proof_quality_score, proof_risk,
-                proof_validation_status, proof_validation_notes, proof_validation_version,
-                detected_links, word_count
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            SELECT * FROM proofs
+            WHERE telegram_id = ? AND task_id = ?
+            ORDER BY id ASC
+            LIMIT 1
             """,
-            (
-                telegram_id,
-                data.task_id,
-                proof_text,
-                "submitted",
-                created,
-                proof_validation["review_status"],
-                proof_validation["quality_note"],
-                xp_awarded,
-                proof_validation["proof_kind"],
-                proof_validation["proof_quality_score"],
-                proof_validation["proof_risk"],
-                proof_validation["proof_validation_status"],
-                proof_validation["proof_validation_notes"],
-                proof_validation["proof_validation_version"],
-                proof_validation["detected_links"],
-                proof_validation["word_count"],
-            )
-        )
+            (telegram_id, data.task_id)
+        ).fetchone()
 
         user = conn.execute(
             "SELECT * FROM users WHERE telegram_id = ?",
@@ -955,62 +951,209 @@ def create_proof(data: ProofCreateRequest):
         ).fetchone()
 
         old_stage = user["guardian_stage"]
-        new_xp = int(user["xp"]) + xp_awarded
-        new_streak = int(user["streak_days"]) + 1
-        new_verified_count = int(user["verified_proofs_count"]) + 1
-        new_stage = calculate_stage(new_streak, new_verified_count)
 
-        conn.execute(
-            """
-            UPDATE users
-            SET xp = ?, streak_days = ?, verified_proofs_count = ?,
-                guardian_stage = ?, updated_at = ?
-            WHERE telegram_id = ?
-            """,
-            (
-                new_xp,
-                new_streak,
-                new_verified_count,
-                new_stage,
-                now_iso(),
-                telegram_id
+        if existing_proof is not None:
+            proof_validation = {
+                "proof_kind": existing_proof["proof_kind"] if "proof_kind" in existing_proof.keys() else "text",
+                "proof_quality_score": existing_proof["proof_quality_score"] if "proof_quality_score" in existing_proof.keys() else 0,
+                "proof_risk": existing_proof["proof_risk"] if "proof_risk" in existing_proof.keys() else "medium",
+                "proof_validation_status": "duplicate_submission",
+                "proof_validation_notes": "برای این قرارداد قبلاً اثبات ثبت شده است. امتیاز و زنجیره دوباره اضافه نشد.",
+                "proof_validation_version": PROOF_CORE_VERSION,
+                "review_status": "duplicate_submission",
+                "quality_note": "Duplicate proof blocked by Execution Integrity V1.",
+                "xp_awarded": 0,
+                "detected_links": 0,
+                "word_count": count_words_loose(proof_text),
+            }
+
+            cursor = conn.execute(
+                """
+                INSERT INTO proofs (
+                    telegram_id, task_id, proof_text, status, created_at,
+                    review_status, quality_note, xp_awarded,
+                    proof_kind, proof_quality_score, proof_risk,
+                    proof_validation_status, proof_validation_notes, proof_validation_version,
+                    detected_links, word_count, integrity_flag, duplicate_of_proof_id, integrity_version
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    telegram_id,
+                    data.task_id,
+                    proof_text,
+                    "duplicate",
+                    created,
+                    proof_validation["review_status"],
+                    proof_validation["quality_note"],
+                    0,
+                    proof_validation["proof_kind"],
+                    proof_validation["proof_quality_score"],
+                    proof_validation["proof_risk"],
+                    proof_validation["proof_validation_status"],
+                    proof_validation["proof_validation_notes"],
+                    proof_validation["proof_validation_version"],
+                    proof_validation["detected_links"],
+                    proof_validation["word_count"],
+                    "duplicate_blocked",
+                    existing_proof["id"],
+                    EXECUTION_INTEGRITY_VERSION,
+                )
             )
-        )
 
-        conn.execute(
-            """
-            INSERT INTO progression_events (
-                telegram_id, event_type, xp_delta, old_stage, new_stage, metadata, created_at
+            conn.execute(
+                """
+                UPDATE tasks
+                SET proof_attempts_count = proof_attempts_count + 1,
+                    integrity_status = 'duplicate_attempt_blocked',
+                    updated_at = ?
+                WHERE id = ? AND telegram_id = ?
+                """,
+                (now_iso(), data.task_id, telegram_id)
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                telegram_id,
-                "proof_submitted",
-                xp_awarded,
-                old_stage,
-                new_stage,
-                f"task_id={data.task_id};review_status={proof_validation['review_status']};proof_score={proof_validation['proof_quality_score']}",
-                now_iso()
+
+            conn.execute(
+                """
+                INSERT INTO progression_events (
+                    telegram_id, event_type, xp_delta, old_stage, new_stage, metadata, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    telegram_id,
+                    "duplicate_proof_blocked",
+                    0,
+                    old_stage,
+                    old_stage,
+                    f"task_id={data.task_id};duplicate_of_proof_id={existing_proof['id']}",
+                    now_iso()
+                )
             )
-        )
 
-        conn.commit()
+            conn.commit()
 
-        proof = conn.execute(
-            "SELECT * FROM proofs WHERE id = ?",
-            (cursor.lastrowid,)
-        ).fetchone()
+            proof = conn.execute(
+                "SELECT * FROM proofs WHERE id = ?",
+                (cursor.lastrowid,)
+            ).fetchone()
 
-        updated_user = conn.execute(
-            "SELECT * FROM users WHERE telegram_id = ?",
-            (telegram_id,)
-        ).fetchone()
+            updated_user = conn.execute(
+                "SELECT * FROM users WHERE telegram_id = ?",
+                (telegram_id,)
+            ).fetchone()
+
+        else:
+            proof_validation = evaluate_proof_quality(proof_text, task)
+            xp_awarded = proof_validation["xp_awarded"]
+
+            cursor = conn.execute(
+                """
+                INSERT INTO proofs (
+                    telegram_id, task_id, proof_text, status, created_at,
+                    review_status, quality_note, xp_awarded,
+                    proof_kind, proof_quality_score, proof_risk,
+                    proof_validation_status, proof_validation_notes, proof_validation_version,
+                    detected_links, word_count, integrity_flag, duplicate_of_proof_id, integrity_version
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    telegram_id,
+                    data.task_id,
+                    proof_text,
+                    "submitted",
+                    created,
+                    proof_validation["review_status"],
+                    proof_validation["quality_note"],
+                    xp_awarded,
+                    proof_validation["proof_kind"],
+                    proof_validation["proof_quality_score"],
+                    proof_validation["proof_risk"],
+                    proof_validation["proof_validation_status"],
+                    proof_validation["proof_validation_notes"],
+                    proof_validation["proof_validation_version"],
+                    proof_validation["detected_links"],
+                    proof_validation["word_count"],
+                    "first_submission",
+                    None,
+                    EXECUTION_INTEGRITY_VERSION,
+                )
+            )
+
+            new_xp = int(user["xp"]) + xp_awarded
+            new_streak = int(user["streak_days"]) + 1
+            new_verified_count = int(user["verified_proofs_count"]) + 1
+            new_stage = calculate_stage(new_streak, new_verified_count)
+
+            conn.execute(
+                """
+                UPDATE users
+                SET xp = ?, streak_days = ?, verified_proofs_count = ?,
+                    guardian_stage = ?, updated_at = ?
+                WHERE telegram_id = ?
+                """,
+                (
+                    new_xp,
+                    new_streak,
+                    new_verified_count,
+                    new_stage,
+                    now_iso(),
+                    telegram_id
+                )
+            )
+
+            conn.execute(
+                """
+                UPDATE tasks
+                SET status = 'completed',
+                    submitted_at = ?,
+                    completed_at = ?,
+                    proof_attempts_count = proof_attempts_count + 1,
+                    integrity_status = 'completed_once',
+                    updated_at = ?
+                WHERE id = ? AND telegram_id = ?
+                """,
+                (created, created, now_iso(), data.task_id, telegram_id)
+            )
+
+            conn.execute(
+                """
+                INSERT INTO progression_events (
+                    telegram_id, event_type, xp_delta, old_stage, new_stage, metadata, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    telegram_id,
+                    "proof_submitted",
+                    xp_awarded,
+                    old_stage,
+                    new_stage,
+                    f"task_id={data.task_id};review_status={proof_validation['review_status']};proof_score={proof_validation['proof_quality_score']}",
+                    now_iso()
+                )
+            )
+
+            conn.commit()
+
+            proof = conn.execute(
+                "SELECT * FROM proofs WHERE id = ?",
+                (cursor.lastrowid,)
+            ).fetchone()
+
+            updated_user = conn.execute(
+                "SELECT * FROM users WHERE telegram_id = ?",
+                (telegram_id,)
+            ).fetchone()
+
+    proof_message_title = "✅ اثبات قرارداد ثبت شد."
+    if proof_validation.get("review_status") == "duplicate_submission":
+        proof_message_title = "⚠️ اثبات تکراری ثبت شد؛ امتیاز دوباره اضافه نشد."
 
     send_bot_message(
         telegram_id,
         (
-            "✅ اثبات قرارداد ثبت شد.\n\n"
+            f"{proof_message_title}\n\n"
             f"عنوان قرارداد: {task['title']}\n"
             f"کیفیت اثبات: {proof_validation['proof_quality_score']} از ۱۰۰\n"
             f"وضعیت بررسی: {review_status_label_fa(proof_validation['review_status'])}\n"
@@ -1143,6 +1286,43 @@ def proofs_history(telegram_id: str, limit: int = 20):
         "proofs": [row_to_dict(row) for row in rows]
     }
 
+
+
+
+@app.get("/execution/integrity")
+def execution_integrity(telegram_id: str):
+    telegram_id = telegram_id.strip()
+    if not telegram_id:
+        raise HTTPException(status_code=400, detail="شناسه تلگرام الزامی است")
+
+    with get_db() as conn:
+        latest_task = conn.execute(
+            """
+            SELECT id, title, status, integrity_status, proof_attempts_count,
+                   submitted_at, completed_at, updated_at
+            FROM tasks
+            WHERE telegram_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (telegram_id,)
+        ).fetchone()
+
+        duplicate_count = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM proofs
+            WHERE telegram_id = ? AND integrity_flag = 'duplicate_blocked'
+            """,
+            (telegram_id,)
+        ).fetchone()["count"]
+
+    return {
+        "ok": True,
+        "integrity_version": EXECUTION_INTEGRITY_VERSION,
+        "latest_task": row_to_dict(latest_task),
+        "duplicate_proofs_blocked": duplicate_count
+    }
 
 
 @app.get("/proofs/latest-validation")
