@@ -12,11 +12,36 @@ from pydantic import BaseModel
 
 DB_PATH = "royal_guardian.db"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+V36C_VALIDATION_VERSION = "v36c-contract-validation-lite-1"
+
+VALID_PROOF_TYPE_MAP = {
+    "text": "text",
+    "link": "link",
+    "file_note": "file_note",
+    "screenshot_note": "screenshot_note",
+    "متن": "text",
+    "لینک": "link",
+    "متن یا لینک": "text",
+    "متن یا عکس": "screenshot_note",
+    "تصویر": "screenshot_note",
+    "عکس": "screenshot_note",
+    "فایل": "file_note",
+}
+
+AMBIGUOUS_WORDS = {
+    "work", "study", "improve", "progress", "better", "project", "learn", "practice", "task",
+    "کار", "مطالعه", "درس", "پروژه", "تمرین", "یادگیری", "یاد گرفتن", "بهبود", "پیشرفت", "بررسی", "پیگیری",
+}
+
+AMBIGUOUS_PREFIXES = (
+    "work on", "study ", "improve", "learn ", "practice ",
+    "روی ", "کار روی", "کار ", "مطالعه ", "درس ", "تمرین ", "یادگیری ", "یاد گرفتن ", "بهبود ", "پیشرفت ", "بررسی ", "پیگیری ",
+)
 
 
 app = FastAPI(
     title="Royal Guardian Backend",
-    version="0.4.0-contract-core"
+    version="0.5.0-v36c-validation"
 )
 
 app.add_middleware(
@@ -90,6 +115,167 @@ def calculate_stage(streak_days: int, verified_proofs_count: int) -> str:
         return "شکاف طلایی"
     return "هسته خاموش"
 
+
+
+def _normalized_text_for_validation(value: str) -> str:
+    return (
+        str(value or "")
+        .strip()
+        .lower()
+        .replace("ي", "ی")
+        .replace("ك", "ک")
+        .replace("‌", " ")
+    )
+
+
+def normalize_proof_type(value: str) -> str:
+    key = str(value or "").strip()
+    return VALID_PROOF_TYPE_MAP.get(key, VALID_PROOF_TYPE_MAP.get(key.lower(), "text"))
+
+
+def validate_done_definition(value: str) -> Optional[str]:
+    lowered = _normalized_text_for_validation(value)
+    if len(lowered) < 8:
+        return "تعریف انجام‌شدن خیلی کوتاه است. خروجی نهایی را دقیق‌تر بنویس."
+    if lowered in AMBIGUOUS_WORDS:
+        return "تعریف انجام‌شدن مبهم است. دقیقاً بگو چه چیزی یعنی کار تمام شده."
+    if any(lowered.startswith(prefix) for prefix in AMBIGUOUS_PREFIXES):
+        return "تعریف انجام‌شدن با فعل مبهم شروع شده. خروجی قابل مشاهده را مشخص کن."
+    return None
+
+
+def evaluate_contract_quality(contract: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    نسخه سبک‌شده از منطق V36C برای ارزیابی قرارداد.
+    این مرحله عمداً soft-gate است: قرارداد را رد نمی‌کند، فقط کیفیت و ریسک را ثبت می‌کند.
+    """
+    errors = []
+    warnings = []
+    score = 20
+
+    title = str(contract.get("title") or "").strip()
+    done_definition = str(contract.get("done_definition") or "").strip()
+    if_then_trigger = str(contract.get("if_then_trigger") or "").strip()
+    if_then_action = str(contract.get("if_then_action") or "").strip()
+    micro_fallback = str(contract.get("micro_fallback") or "").strip()
+    proof_type = str(contract.get("proof_type") or "").strip()
+    normalized_proof_type = normalize_proof_type(proof_type)
+
+    if not title:
+        errors.append("عنوان قرارداد خالی است.")
+    elif len(title) >= 6:
+        score += 5
+    else:
+        warnings.append("عنوان قرارداد بهتر است مشخص‌تر باشد.")
+
+    done_error = validate_done_definition(done_definition)
+    if done_error:
+        warnings.append(done_error)
+    else:
+        score += 12
+
+    if len(done_definition) >= 18:
+        score += 18
+    elif done_definition:
+        score += 6
+
+    if len(if_then_trigger) >= 12 and len(if_then_action) >= 12:
+        score += 15
+    else:
+        warnings.append("بخش اگر/آنگاه را دقیق‌تر کن تا در لحظه مقاومت، مسیر اجرا روشن باشد.")
+
+    if len(micro_fallback) >= 8:
+        score += 15
+    else:
+        warnings.append("نسخه اضطراری را واضح‌تر بنویس؛ مثلاً حداقل ۵ دقیقه یا یک خروجی کوچک.")
+
+    if normalized_proof_type in {"link", "file_note", "screenshot_note"}:
+        score += 10
+    else:
+        score += 5
+
+    try:
+        minutes = int(contract.get("estimated_minutes") or 30)
+    except Exception:
+        minutes = 30
+        warnings.append("زمان تخمینی قابل خواندن نبود؛ مقدار ۳۰ دقیقه فرض شد.")
+
+    if 1 <= minutes <= 60:
+        score += 10
+    elif minutes <= 120:
+        score += 5
+    else:
+        warnings.append("زمان تخمینی سنگین است. بهتر است قرارداد را کوچک‌تر یا دو مرحله‌ای کنی.")
+
+    if str(contract.get("deadline") or "").strip():
+        score += 5
+    else:
+        warnings.append("مهلت قرارداد مشخص نیست.")
+
+    score = max(0, min(int(score), 100))
+
+    risk_points = 0
+    if score < 60:
+        risk_points += 25
+    elif score < 75:
+        risk_points += 10
+    if minutes > 90:
+        risk_points += 15
+    if not if_then_trigger or not if_then_action:
+        risk_points += 10
+    if not micro_fallback:
+        risk_points += 10
+    if str(contract.get("difficulty") or "normal").lower() == "hard":
+        risk_points += 8
+
+    if risk_points >= 35:
+        predicted_risk = "high"
+    elif risk_points >= 15:
+        predicted_risk = "medium"
+    else:
+        predicted_risk = "low"
+
+    if errors or score < 55:
+        validation_status = "needs_refinement"
+    elif score >= 75 and predicted_risk != "high":
+        validation_status = "strong"
+    else:
+        validation_status = "usable"
+
+    notes = []
+    if errors:
+        notes.extend(errors)
+    notes.extend(warnings[:3])
+    if not notes:
+        notes.append("قرارداد شفاف، قابل اجرا و قابل اثبات است.")
+
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "warnings": warnings,
+        "quality_score": score,
+        "predicted_risk": predicted_risk,
+        "validation_status": validation_status,
+        "validation_notes": " | ".join(notes),
+        "normalized_proof_type": normalized_proof_type,
+        "validation_version": V36C_VALIDATION_VERSION,
+    }
+
+
+def risk_label_fa(risk: str) -> str:
+    return {
+        "low": "پایین",
+        "medium": "متوسط",
+        "high": "بالا",
+    }.get(str(risk), "نامشخص")
+
+
+def status_label_fa(status: str) -> str:
+    return {
+        "strong": "قوی",
+        "usable": "قابل اجرا",
+        "needs_refinement": "نیازمند اصلاح",
+    }.get(str(status), "نامشخص")
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
     """
@@ -172,6 +358,12 @@ def init_db():
         ensure_column(conn, "tasks", "contract_type", "TEXT NOT NULL DEFAULT 'execution_contract'")
         ensure_column(conn, "tasks", "difficulty", "TEXT NOT NULL DEFAULT 'normal'")
         ensure_column(conn, "tasks", "source", "TEXT NOT NULL DEFAULT 'mini_app'")
+        ensure_column(conn, "tasks", "normalized_proof_type", "TEXT NOT NULL DEFAULT 'text'")
+        ensure_column(conn, "tasks", "contract_quality_score", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "tasks", "predicted_risk", "TEXT NOT NULL DEFAULT 'unknown'")
+        ensure_column(conn, "tasks", "validation_status", "TEXT NOT NULL DEFAULT 'unknown'")
+        ensure_column(conn, "tasks", "validation_notes", "TEXT")
+        ensure_column(conn, "tasks", "validation_version", "TEXT")
         ensure_column(conn, "proofs", "review_status", "TEXT NOT NULL DEFAULT 'auto_accepted'")
         ensure_column(conn, "proofs", "quality_note", "TEXT")
         ensure_column(conn, "proofs", "xp_awarded", "INTEGER NOT NULL DEFAULT 25")
@@ -203,6 +395,7 @@ class TaskCreateRequest(BaseModel):
     micro_fallback: Optional[str] = None
     estimated_minutes: int = 30
     difficulty: str = "normal"
+    strict_validation: bool = False
 
 
 class ProofCreateRequest(BaseModel):
@@ -217,7 +410,7 @@ def root():
         "status": "ok",
         "message": "Royal Guardian backend is running",
         "database": DB_PATH,
-        "version": "0.4.0-contract-core"
+        "version": "0.5.0-v36c-validation"
     }
 
 
@@ -228,7 +421,7 @@ def health():
         "time": now_iso(),
         "database": DB_PATH,
         "bot_token_configured": bool(BOT_TOKEN),
-        "version": "0.4.0-contract-core"
+        "version": "0.5.0-v36c-validation"
     }
 
 
@@ -318,6 +511,7 @@ def normalize_contract_payload(data: TaskCreateRequest) -> Dict[str, Any]:
         "title": title,
         "deadline": deadline,
         "proof_type": proof_type,
+        "normalized_proof_type": normalize_proof_type(proof_type),
         "done_definition": done_definition,
         "if_then_trigger": if_then_trigger,
         "if_then_action": if_then_action,
@@ -337,6 +531,10 @@ def create_contract_record(data: TaskCreateRequest):
     if not contract["title"]:
         raise HTTPException(status_code=400, detail="عنوان تعهد الزامی است")
 
+    validation = evaluate_contract_quality(contract)
+    if data.strict_validation and validation["validation_status"] == "needs_refinement":
+        raise HTTPException(status_code=422, detail=validation["validation_notes"])
+
     with get_db() as conn:
         ensure_user_exists(conn, telegram_id)
 
@@ -346,9 +544,10 @@ def create_contract_record(data: TaskCreateRequest):
             INSERT INTO tasks (
                 telegram_id, title, deadline, proof_type, status, created_at, updated_at,
                 done_definition, if_then_trigger, if_then_action, micro_fallback,
-                estimated_minutes, contract_type, difficulty, source
+                estimated_minutes, contract_type, difficulty, source,
+                normalized_proof_type, contract_quality_score, predicted_risk, validation_status, validation_notes, validation_version
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 telegram_id,
@@ -365,7 +564,13 @@ def create_contract_record(data: TaskCreateRequest):
                 contract["estimated_minutes"],
                 "execution_contract",
                 contract["difficulty"],
-                "mini_app"
+                "mini_app",
+                validation["normalized_proof_type"],
+                validation["quality_score"],
+                validation["predicted_risk"],
+                validation["validation_status"],
+                validation["validation_notes"],
+                validation["validation_version"]
             )
         )
         conn.commit()
@@ -383,7 +588,10 @@ def create_contract_record(data: TaskCreateRequest):
             f"تعریف انجام‌شدن: {contract['done_definition']}\n"
             f"مهلت: {contract['deadline']}\n"
             f"نوع اثبات: {contract['proof_type']}\n"
-            f"نسخه اضطراری: {contract['micro_fallback']}"
+            f"نسخه اضطراری: {contract['micro_fallback']}\n"
+            f"کیفیت قرارداد: {validation['quality_score']} از ۱۰۰ ({status_label_fa(validation['validation_status'])})\n"
+            f"ریسک اجرا: {risk_label_fa(validation['predicted_risk'])}\n"
+            f"یادداشت: {validation['validation_notes']}"
         )
     )
 
@@ -492,6 +700,18 @@ def create_task(data: TaskCreateRequest):
 @app.post("/contracts")
 def create_contract(data: TaskCreateRequest):
     return create_contract_record(data)
+
+
+
+@app.post("/contracts/validate")
+def validate_contract(data: TaskCreateRequest):
+    contract = normalize_contract_payload(data)
+    validation = evaluate_contract_quality(contract)
+    return {
+        "ok": True,
+        "contract": contract,
+        "validation": validation
+    }
 
 
 @app.post("/proofs")
