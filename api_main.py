@@ -1,6 +1,7 @@
 from datetime import datetime
 from typing import Optional, Dict, Any
 import os
+import re
 import sqlite3
 import urllib.parse
 import urllib.request
@@ -13,6 +14,7 @@ from pydantic import BaseModel
 DB_PATH = "royal_guardian.db"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 V36C_VALIDATION_VERSION = "v36c-contract-validation-lite-1"
+PROOF_CORE_VERSION = "v36c-proof-core-lite-1"
 
 VALID_PROOF_TYPE_MAP = {
     "text": "text",
@@ -41,7 +43,7 @@ AMBIGUOUS_PREFIXES = (
 
 app = FastAPI(
     title="Royal Guardian Backend",
-    version="0.5.1-v36c-validation-message"
+    version="0.6.0-proof-core-v1"
 )
 
 app.add_middleware(
@@ -277,6 +279,142 @@ def status_label_fa(status: str) -> str:
         "needs_refinement": "نیازمند اصلاح",
     }.get(str(status), "نامشخص")
 
+
+def count_words_loose(value: str) -> int:
+    cleaned = str(value or "").strip()
+    if not cleaned:
+        return 0
+    return len([part for part in re.split(r"\s+", cleaned) if part])
+
+
+def extract_links(value: str) -> list[str]:
+    return re.findall(r"https?://[^\s]+|www\.[^\s]+", str(value or ""), flags=re.IGNORECASE)
+
+
+def evaluate_proof_quality(proof_text: str, task: sqlite3.Row) -> Dict[str, Any]:
+    """
+    Proof Core V1: نسخه سبک‌شده از منطق اثبات V36C.
+    هدف فعلی: امتیازدهی، تشخیص ریسک، review_status و پیام شفاف؛ بدون شکستن جریان MVP.
+    """
+    text_value = str(proof_text or "").strip()
+    lowered = _normalized_text_for_validation(text_value)
+    links = extract_links(text_value)
+    word_count = count_words_loose(text_value)
+    char_count = len(text_value)
+
+    task_dict = row_to_dict(task) or {}
+    normalized_proof_type = str(task_dict.get("normalized_proof_type") or normalize_proof_type(task_dict.get("proof_type") or "text"))
+
+    warnings = []
+    errors = []
+    score = 15
+
+    if char_count < 8:
+        errors.append("متن اثبات خیلی کوتاه است.")
+    elif char_count < 25:
+        warnings.append("اثبات کوتاه است؛ بهتر است خروجی مشخص‌تر نوشته شود.")
+        score += 8
+    elif char_count < 80:
+        score += 18
+    else:
+        score += 28
+
+    if word_count >= 8:
+        score += 12
+    elif word_count >= 4:
+        score += 6
+    else:
+        warnings.append("اثبات بهتر است شامل چند جزئیات قابل بررسی باشد.")
+
+    if links:
+        score += 18
+    elif normalized_proof_type == "link":
+        warnings.append("نوع اثبات لینک است، اما لینکی در متن پیدا نشد.")
+
+    proof_detail_markers = [
+        "انجام", "کامل", "خلاصه", "نوشتم", "خواندم", "ساختم", "ارسال", "ثبت", "تمام",
+        "done", "completed", "summary", "finished", "built", "sent"
+    ]
+    if any(marker in lowered for marker in proof_detail_markers):
+        score += 10
+    else:
+        warnings.append("اثبات بهتر است واضح بگوید دقیقاً چه خروجی‌ای انجام شد.")
+
+    title = _normalized_text_for_validation(task_dict.get("title") or "")
+    done_definition = _normalized_text_for_validation(task_dict.get("done_definition") or "")
+    if title and any(token for token in title.split() if len(token) >= 4 and token in lowered):
+        score += 8
+    if done_definition and any(token for token in done_definition.split() if len(token) >= 5 and token in lowered):
+        score += 7
+
+    estimated_minutes = int(task_dict.get("estimated_minutes") or 30)
+    if estimated_minutes > 90 and char_count < 60 and not links:
+        warnings.append("برای قرارداد سنگین، اثبات فعلی کمی سبک است.")
+
+    score = max(0, min(int(score), 100))
+
+    if errors:
+        review_status = "needs_review"
+        proof_risk = "high"
+    elif score >= 75:
+        review_status = "auto_accepted"
+        proof_risk = "low"
+    elif score >= 55:
+        review_status = "auto_accepted"
+        proof_risk = "medium"
+    else:
+        review_status = "needs_review"
+        proof_risk = "high"
+
+    if review_status == "auto_accepted":
+        if score >= 85:
+            xp_awarded = 35
+        elif score >= 70:
+            xp_awarded = 25
+        else:
+            xp_awarded = 15
+    else:
+        xp_awarded = 5
+
+    notes = []
+    if errors:
+        notes.extend(errors)
+    notes.extend(warnings[:4])
+    if not notes:
+        notes.append("اثبات قابل قبول و هم‌راستا با قرارداد است.")
+
+    return {
+        "ok": not errors,
+        "proof_kind": normalized_proof_type,
+        "proof_quality_score": score,
+        "proof_risk": proof_risk,
+        "proof_validation_status": review_status,
+        "proof_validation_notes": " | ".join(notes),
+        "proof_validation_version": PROOF_CORE_VERSION,
+        "review_status": review_status,
+        "quality_note": " | ".join(notes),
+        "xp_awarded": xp_awarded,
+        "detected_links": len(links),
+        "word_count": word_count,
+        "char_count": char_count,
+    }
+
+
+def proof_risk_label_fa(risk: str) -> str:
+    return {
+        "low": "پایین",
+        "medium": "متوسط",
+        "high": "بالا",
+    }.get(str(risk), "نامشخص")
+
+
+def review_status_label_fa(status: str) -> str:
+    return {
+        "auto_accepted": "پذیرفته‌شده خودکار",
+        "needs_review": "نیازمند بررسی",
+        "rejected": "رد شده",
+    }.get(str(status), "نامشخص")
+
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
     """
     مهاجرت ساده SQLite: اگر ستون وجود نداشت، اضافه می‌شود.
@@ -367,6 +505,14 @@ def init_db():
         ensure_column(conn, "proofs", "review_status", "TEXT NOT NULL DEFAULT 'auto_accepted'")
         ensure_column(conn, "proofs", "quality_note", "TEXT")
         ensure_column(conn, "proofs", "xp_awarded", "INTEGER NOT NULL DEFAULT 25")
+        ensure_column(conn, "proofs", "proof_kind", "TEXT NOT NULL DEFAULT 'text'")
+        ensure_column(conn, "proofs", "proof_quality_score", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "proofs", "proof_risk", "TEXT NOT NULL DEFAULT 'unknown'")
+        ensure_column(conn, "proofs", "proof_validation_status", "TEXT NOT NULL DEFAULT 'unknown'")
+        ensure_column(conn, "proofs", "proof_validation_notes", "TEXT")
+        ensure_column(conn, "proofs", "proof_validation_version", "TEXT")
+        ensure_column(conn, "proofs", "detected_links", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "proofs", "word_count", "INTEGER NOT NULL DEFAULT 0")
 
         conn.commit()
 
@@ -410,7 +556,7 @@ def root():
         "status": "ok",
         "message": "Royal Guardian backend is running",
         "database": DB_PATH,
-        "version": "0.5.1-v36c-validation-message"
+        "version": "0.6.0-proof-core-v1"
     }
 
 
@@ -421,7 +567,7 @@ def health():
         "time": now_iso(),
         "database": DB_PATH,
         "bot_token_configured": bool(BOT_TOKEN),
-        "version": "0.5.1-v36c-validation-message"
+        "version": "0.6.0-proof-core-v1"
     }
 
 
@@ -716,6 +862,35 @@ def validate_contract(data: TaskCreateRequest):
     }
 
 
+
+@app.post("/proofs/validate")
+def validate_proof(data: ProofCreateRequest):
+    telegram_id = data.telegram_id.strip()
+    proof_text = data.proof_text.strip()
+
+    if not telegram_id:
+        raise HTTPException(status_code=400, detail="شناسه تلگرام الزامی است")
+    if not proof_text:
+        raise HTTPException(status_code=400, detail="متن اثبات الزامی است")
+
+    with get_db() as conn:
+        task = conn.execute(
+            "SELECT * FROM tasks WHERE id = ? AND telegram_id = ?",
+            (data.task_id, telegram_id)
+        ).fetchone()
+
+    if task is None:
+        raise HTTPException(status_code=404, detail="تعهد پیدا نشد")
+
+    validation = evaluate_proof_quality(proof_text, task)
+
+    return {
+        "ok": True,
+        "proof_validation": validation,
+        "contract": row_to_dict(task)
+    }
+
+
 @app.post("/proofs")
 def create_proof(data: ProofCreateRequest):
     telegram_id = data.telegram_id.strip()
@@ -740,14 +915,19 @@ def create_proof(data: ProofCreateRequest):
 
         created = now_iso()
 
-        xp_awarded = 25
+        proof_validation = evaluate_proof_quality(proof_text, task)
+        xp_awarded = proof_validation["xp_awarded"]
+
         cursor = conn.execute(
             """
             INSERT INTO proofs (
                 telegram_id, task_id, proof_text, status, created_at,
-                review_status, quality_note, xp_awarded
+                review_status, quality_note, xp_awarded,
+                proof_kind, proof_quality_score, proof_risk,
+                proof_validation_status, proof_validation_notes, proof_validation_version,
+                detected_links, word_count
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 telegram_id,
@@ -755,9 +935,17 @@ def create_proof(data: ProofCreateRequest):
                 proof_text,
                 "submitted",
                 created,
-                "auto_accepted",
-                "MVP auto-accepted proof",
-                xp_awarded
+                proof_validation["review_status"],
+                proof_validation["quality_note"],
+                xp_awarded,
+                proof_validation["proof_kind"],
+                proof_validation["proof_quality_score"],
+                proof_validation["proof_risk"],
+                proof_validation["proof_validation_status"],
+                proof_validation["proof_validation_notes"],
+                proof_validation["proof_validation_version"],
+                proof_validation["detected_links"],
+                proof_validation["word_count"],
             )
         )
 
@@ -802,7 +990,7 @@ def create_proof(data: ProofCreateRequest):
                 xp_awarded,
                 old_stage,
                 new_stage,
-                f"task_id={data.task_id};review_status=auto_accepted",
+                f"task_id={data.task_id};review_status={proof_validation['review_status']};proof_score={proof_validation['proof_quality_score']}",
                 now_iso()
             )
         )
@@ -824,15 +1012,21 @@ def create_proof(data: ProofCreateRequest):
         (
             "✅ اثبات قرارداد ثبت شد.\n\n"
             f"عنوان قرارداد: {task['title']}\n"
+            f"کیفیت اثبات: {proof_validation['proof_quality_score']} از ۱۰۰\n"
+            f"وضعیت بررسی: {review_status_label_fa(proof_validation['review_status'])}\n"
+            f"ریسک اثبات: {proof_risk_label_fa(proof_validation['proof_risk'])}\n"
+            f"امتیاز افزوده‌شده: {proof_validation['xp_awarded']}\n"
             f"امتیاز اجرایی: {updated_user['xp']}\n"
             f"زنجیره اجرا: {updated_user['streak_days']} روز\n"
-            f"مرحله نگهبان: {updated_user['guardian_stage']}"
+            f"مرحله نگهبان: {updated_user['guardian_stage']}\n"
+            f"یادداشت: {proof_validation['proof_validation_notes']}"
         )
     )
 
     return {
         "ok": True,
         "proof": row_to_dict(proof),
+        "proof_validation": proof_validation,
         "user": row_to_dict(updated_user),
         "contract": row_to_dict(task)
     }
@@ -947,6 +1141,40 @@ def proofs_history(telegram_id: str, limit: int = 20):
     return {
         "ok": True,
         "proofs": [row_to_dict(row) for row in rows]
+    }
+
+
+
+@app.get("/proofs/latest-validation")
+def latest_proof_validation(telegram_id: str):
+    telegram_id = telegram_id.strip()
+    if not telegram_id:
+        raise HTTPException(status_code=400, detail="شناسه تلگرام الزامی است")
+
+    with get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT id, telegram_id, task_id, proof_text, status, review_status,
+                   quality_note, xp_awarded, proof_kind, proof_quality_score,
+                   proof_risk, proof_validation_status, proof_validation_notes,
+                   proof_validation_version, detected_links, word_count, created_at
+            FROM proofs
+            WHERE telegram_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (telegram_id,)
+        ).fetchone()
+
+    if row is None:
+        return {
+            "ok": False,
+            "message": "اثباتی پیدا نشد"
+        }
+
+    return {
+        "ok": True,
+        "proof_validation": row_to_dict(row)
     }
 
 
