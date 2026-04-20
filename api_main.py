@@ -1,6 +1,9 @@
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
+import os
 import sqlite3
+import urllib.parse
+import urllib.request
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,11 +11,12 @@ from pydantic import BaseModel
 
 
 DB_PATH = "royal_guardian.db"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 
 app = FastAPI(
     title="Royal Guardian Backend",
-    version="0.2.0"
+    version="0.3.0"
 )
 
 app.add_middleware(
@@ -38,6 +42,39 @@ def row_to_dict(row) -> Optional[Dict[str, Any]]:
     if row is None:
         return None
     return dict(row)
+
+
+def send_bot_message(chat_id: str, text: str) -> bool:
+    """
+    ارسال پیام از طریق Bot API تلگرام.
+    اگر توکن تنظیم نشده باشد یا ارسال شکست بخورد، منطق اصلی بک‌اند نباید خراب شود.
+    """
+    if not BOT_TOKEN:
+        print("[telegram_notify_skipped] BOT_TOKEN is not configured")
+        return False
+
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        payload = urllib.parse.urlencode({
+            "chat_id": str(chat_id),
+            "text": text
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST"
+        )
+
+        with urllib.request.urlopen(req, timeout=8) as response:
+            ok = 200 <= response.status < 300
+            print(f"[telegram_notify] chat_id={chat_id} status={response.status} ok={ok}")
+            return ok
+
+    except Exception as exc:
+        print(f"[telegram_notify_failed] chat_id={chat_id} error={exc}")
+        return False
 
 
 def calculate_stage(streak_days: int, verified_proofs_count: int) -> str:
@@ -152,7 +189,29 @@ def health():
     return {
         "ok": True,
         "time": now_iso(),
-        "database": DB_PATH
+        "database": DB_PATH,
+        "bot_token_configured": bool(BOT_TOKEN)
+    }
+
+
+@app.get("/bot/status")
+def bot_status():
+    return {
+        "ok": True,
+        "bot_token_configured": bool(BOT_TOKEN)
+    }
+
+
+@app.post("/bot/test-message")
+def bot_test_message(telegram_id: str):
+    sent = send_bot_message(
+        telegram_id,
+        "✅ اتصال بک‌اند به بات فعال شد.\n\nاین پیام تست از Render Backend ارسال شده است."
+    )
+    return {
+        "ok": True,
+        "telegram_id": telegram_id,
+        "sent": sent
     }
 
 
@@ -348,6 +407,16 @@ def create_task(data: TaskCreateRequest):
             (cursor.lastrowid,)
         ).fetchone()
 
+    send_bot_message(
+        telegram_id,
+        (
+            "✅ تعهد تازه ثبت شد.\n\n"
+            f"عنوان: {title}\n"
+            f"مهلت: {deadline}\n"
+            f"نوع اثبات: {proof_type}"
+        )
+    )
+
     return {
         "ok": True,
         "task": row_to_dict(task)
@@ -478,6 +547,16 @@ def create_proof(data: ProofCreateRequest):
             "SELECT * FROM users WHERE telegram_id = ?",
             (telegram_id,)
         ).fetchone()
+
+    send_bot_message(
+        telegram_id,
+        (
+            "✅ اثبات ثبت شد.\n\n"
+            f"امتیاز اجرایی: {updated_user['xp']}\n"
+            f"زنجیره اجرا: {updated_user['streak_days']} روز\n"
+            f"مرحله نگهبان: {updated_user['guardian_stage']}"
+        )
+    )
 
     return {
         "ok": True,
