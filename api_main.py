@@ -41,7 +41,7 @@ AMBIGUOUS_PREFIXES = (
 
 app = FastAPI(
     title="Royal Guardian Backend",
-    version="0.5.0-v36c-validation"
+    version="0.5.1-v36c-validation-message"
 )
 
 app.add_middleware(
@@ -410,7 +410,7 @@ def root():
         "status": "ok",
         "message": "Royal Guardian backend is running",
         "database": DB_PATH,
-        "version": "0.5.0-v36c-validation"
+        "version": "0.5.1-v36c-validation-message"
     }
 
 
@@ -421,7 +421,7 @@ def health():
         "time": now_iso(),
         "database": DB_PATH,
         "bot_token_configured": bool(BOT_TOKEN),
-        "version": "0.5.0-v36c-validation"
+        "version": "0.5.1-v36c-validation-message"
     }
 
 
@@ -589,6 +589,8 @@ def create_contract_record(data: TaskCreateRequest):
             f"مهلت: {contract['deadline']}\n"
             f"نوع اثبات: {contract['proof_type']}\n"
             f"نسخه اضطراری: {contract['micro_fallback']}\n"
+            f"اگر: {contract['if_then_trigger'] or 'ثبت نشده'}\n"
+            f"آنگاه: {contract['if_then_action'] or 'ثبت نشده'}\n"
             f"کیفیت قرارداد: {validation['quality_score']} از ۱۰۰ ({status_label_fa(validation['validation_status'])})\n"
             f"ریسک اجرا: {risk_label_fa(validation['predicted_risk'])}\n"
             f"یادداشت: {validation['validation_notes']}"
@@ -862,6 +864,39 @@ def get_progress(telegram_id: str):
             "guardian_stage": user["guardian_stage"],
             "verified_proofs_count": user["verified_proofs_count"]
         }
+    }
+
+
+@app.get("/contracts/latest-validation")
+def latest_contract_validation(telegram_id: str):
+    telegram_id = telegram_id.strip()
+    if not telegram_id:
+        raise HTTPException(status_code=400, detail="شناسه تلگرام الزامی است")
+
+    with get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT id, title, done_definition, if_then_trigger, if_then_action,
+                   micro_fallback, estimated_minutes, proof_type,
+                   normalized_proof_type, contract_quality_score, predicted_risk,
+                   validation_status, validation_notes, validation_version
+            FROM tasks
+            WHERE telegram_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (telegram_id,)
+        ).fetchone()
+
+    if row is None:
+        return {
+            "ok": False,
+            "message": "قراردادی پیدا نشد"
+        }
+
+    return {
+        "ok": True,
+        "contract_validation": row_to_dict(row)
     }
 
 
