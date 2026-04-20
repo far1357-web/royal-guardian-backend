@@ -17,6 +17,7 @@ V36C_VALIDATION_VERSION = "v36c-contract-validation-lite-1"
 PROOF_CORE_VERSION = "v36c-proof-core-lite-1"
 EXECUTION_INTEGRITY_VERSION = "v36c-execution-integrity-lite-1"
 DAILY_LIFECYCLE_VERSION = "v36c-daily-lifecycle-lite-1"
+REVIEW_APPEAL_VERSION = "v36c-review-appeal-lite-1"
 
 VALID_PROOF_TYPE_MAP = {
     "text": "text",
@@ -45,7 +46,7 @@ AMBIGUOUS_PREFIXES = (
 
 app = FastAPI(
     title="Royal Guardian Backend",
-    version="0.8.0-daily-lifecycle-v1"
+    version="0.9.0-review-appeal-v1"
 )
 
 app.add_middleware(
@@ -419,6 +420,9 @@ def review_status_label_fa(status: str) -> str:
         "auto_accepted": "پذیرفته‌شده خودکار",
         "needs_review": "نیازمند بررسی",
         "duplicate_submission": "تکراری؛ امتیاز دوباره ثبت نشد",
+        "accepted": "پذیرفته‌شده",
+        "accepted_after_appeal": "پذیرفته‌شده پس از اعتراض",
+        "needs_revision": "نیازمند اصلاح",
         "rejected": "رد شده",
     }.get(str(status), "نامشخص")
 
@@ -505,6 +509,165 @@ def close_previous_active_contracts(conn: sqlite3.Connection, telegram_id: str) 
     )
 
     return len(rows)
+
+
+def calculate_review_priority(proof_validation: Dict[str, Any], task) -> int:
+    score = int(proof_validation.get("proof_quality_score") or 0)
+    risk = proof_validation.get("proof_risk") or "medium"
+    status = proof_validation.get("review_status") or proof_validation.get("proof_validation_status") or "unknown"
+
+    priority = 30
+    if status == "needs_review":
+        priority += 35
+    if risk == "high":
+        priority += 25
+    elif risk == "medium":
+        priority += 10
+    if score < 40:
+        priority += 20
+    elif score < 60:
+        priority += 10
+
+    task_dict = row_to_dict(task) or {}
+    if str(task_dict.get("difficulty") or "").lower() == "hard":
+        priority += 5
+
+    return max(0, min(priority, 100))
+
+
+def apply_review_award(
+    conn: sqlite3.Connection,
+    *,
+    proof,
+    task,
+    reviewer_id: str,
+    note: str,
+    xp_award: Optional[int],
+    event_type: str,
+    accepted_status: str,
+) -> Dict[str, Any]:
+    """
+    امتیازدهی بعد از review یا appeal.
+    محافظت می‌کند که یک proof دوبار award نشود.
+    """
+    proof_dict = row_to_dict(proof) or {}
+    task_dict = row_to_dict(task) or {}
+    telegram_id = proof_dict["telegram_id"]
+
+    user = conn.execute(
+        "SELECT * FROM users WHERE telegram_id = ?",
+        (telegram_id,)
+    ).fetchone()
+
+    if user is None:
+        raise HTTPException(status_code=404, detail="کاربر پیدا نشد")
+
+    already_awarded = int(proof_dict.get("awarded_after_review") or 0) == 1
+    if already_awarded or proof_dict.get("review_status") in {"auto_accepted", "accepted", "accepted_after_appeal"}:
+        return {
+            "awarded": False,
+            "reason": "این اثبات قبلاً پذیرفته یا امتیازدهی شده است.",
+            "user": row_to_dict(user),
+        }
+
+    quality_score = int(proof_dict.get("proof_quality_score") or 0)
+    if xp_award is None:
+        if quality_score >= 85:
+            xp_award = 35
+        elif quality_score >= 70:
+            xp_award = 25
+        elif quality_score >= 50:
+            xp_award = 15
+        else:
+            xp_award = 10
+
+    xp_award = max(0, min(int(xp_award), 50))
+
+    old_stage = user["guardian_stage"]
+    new_xp = int(user["xp"]) + xp_award
+    new_streak = int(user["streak_days"]) + 1
+    new_verified_count = int(user["verified_proofs_count"]) + 1
+    new_stage = calculate_stage(new_streak, new_verified_count)
+    reviewed_at = now_iso()
+
+    conn.execute(
+        """
+        UPDATE users
+        SET xp = ?, streak_days = ?, verified_proofs_count = ?,
+            guardian_stage = ?, updated_at = ?
+        WHERE telegram_id = ?
+        """,
+        (new_xp, new_streak, new_verified_count, new_stage, reviewed_at, telegram_id)
+    )
+
+    conn.execute(
+        """
+        UPDATE proofs
+        SET status = 'accepted',
+            review_status = ?,
+            review_decision = ?,
+            reviewer_id = ?,
+            reviewer_note = ?,
+            reviewed_at = ?,
+            xp_awarded = ?,
+            awarded_after_review = 1,
+            review_version = ?
+        WHERE id = ?
+        """,
+        (
+            accepted_status,
+            accepted_status,
+            reviewer_id,
+            note,
+            reviewed_at,
+            xp_award,
+            REVIEW_APPEAL_VERSION,
+            proof_dict["id"],
+        )
+    )
+
+    conn.execute(
+        """
+        UPDATE tasks
+        SET status = 'completed',
+            lifecycle_status = 'completed',
+            completed_at = ?,
+            integrity_status = 'completed_after_review',
+            lifecycle_version = ?,
+            updated_at = ?
+        WHERE id = ? AND telegram_id = ?
+        """,
+        (reviewed_at, DAILY_LIFECYCLE_VERSION, reviewed_at, task_dict["id"], telegram_id)
+    )
+
+    conn.execute(
+        """
+        INSERT INTO progression_events (
+            telegram_id, event_type, xp_delta, old_stage, new_stage, metadata, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            telegram_id,
+            event_type,
+            xp_award,
+            old_stage,
+            new_stage,
+            f"proof_id={proof_dict['id']};task_id={task_dict['id']};reviewer_id={reviewer_id}",
+            reviewed_at,
+        )
+    )
+
+    updated_user = conn.execute(
+        "SELECT * FROM users WHERE telegram_id = ?",
+        (telegram_id,)
+    ).fetchone()
+
+    return {
+        "awarded": True,
+        "xp_awarded": xp_award,
+        "user": row_to_dict(updated_user),
+    }
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
     """
@@ -616,6 +779,31 @@ def init_db():
         ensure_column(conn, "tasks", "closed_at", "TEXT")
         ensure_column(conn, "tasks", "close_reason", "TEXT")
         ensure_column(conn, "tasks", "lifecycle_version", "TEXT")
+        ensure_column(conn, "proofs", "review_priority", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "proofs", "reviewer_id", "TEXT")
+        ensure_column(conn, "proofs", "reviewer_note", "TEXT")
+        ensure_column(conn, "proofs", "reviewed_at", "TEXT")
+        ensure_column(conn, "proofs", "review_decision", "TEXT")
+        ensure_column(conn, "proofs", "review_version", "TEXT")
+        ensure_column(conn, "proofs", "awarded_after_review", "INTEGER NOT NULL DEFAULT 0")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS proof_appeals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id TEXT NOT NULL,
+                proof_id INTEGER NOT NULL,
+                task_id INTEGER NOT NULL,
+                appeal_text TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                reviewer_id TEXT,
+                resolution_note TEXT,
+                created_at TEXT NOT NULL,
+                resolved_at TEXT,
+                FOREIGN KEY (telegram_id) REFERENCES users (telegram_id),
+                FOREIGN KEY (proof_id) REFERENCES proofs (id),
+                FOREIGN KEY (task_id) REFERENCES tasks (id)
+            )
+        """)
 
         conn.commit()
 
@@ -653,13 +841,35 @@ class ProofCreateRequest(BaseModel):
     proof_text: str
 
 
+class ReviewDecisionRequest(BaseModel):
+    proof_id: int
+    reviewer_id: str = "admin"
+    decision: str
+    note: Optional[str] = None
+    xp_award: Optional[int] = None
+
+
+class AppealCreateRequest(BaseModel):
+    telegram_id: str
+    proof_id: int
+    appeal_text: str
+
+
+class AppealResolveRequest(BaseModel):
+    appeal_id: int
+    reviewer_id: str = "admin"
+    decision: str
+    resolution_note: Optional[str] = None
+    xp_award: Optional[int] = None
+
+
 @app.get("/")
 def root():
     return {
         "status": "ok",
         "message": "Royal Guardian backend is running",
         "database": DB_PATH,
-        "version": "0.8.0-daily-lifecycle-v1"
+        "version": "0.9.0-review-appeal-v1"
     }
 
 
@@ -670,7 +880,7 @@ def health():
         "time": now_iso(),
         "database": DB_PATH,
         "bot_token_configured": bool(BOT_TOKEN),
-        "version": "0.8.0-daily-lifecycle-v1"
+        "version": "0.9.0-review-appeal-v1"
     }
 
 
@@ -1051,6 +1261,10 @@ def create_proof(data: ProofCreateRequest):
             """
             SELECT * FROM proofs
             WHERE telegram_id = ? AND task_id = ?
+              AND review_status IN (
+                'auto_accepted', 'accepted', 'accepted_after_appeal',
+                'needs_review', 'duplicate_submission'
+              )
             ORDER BY id ASC
             LIMIT 1
             """,
@@ -1120,7 +1334,9 @@ def create_proof(data: ProofCreateRequest):
 
         else:
             proof_validation = evaluate_proof_quality(proof_text, task)
-            xp_awarded = proof_validation["xp_awarded"]
+            needs_review = proof_validation["review_status"] == "needs_review"
+            xp_awarded = 0 if needs_review else proof_validation["xp_awarded"]
+            review_priority = calculate_review_priority(proof_validation, task)
 
             cursor = conn.execute(
                 """
@@ -1129,9 +1345,10 @@ def create_proof(data: ProofCreateRequest):
                     review_status, quality_note, xp_awarded,
                     proof_kind, proof_quality_score, proof_risk,
                     proof_validation_status, proof_validation_notes, proof_validation_version,
-                    detected_links, word_count, integrity_flag, duplicate_of_proof_id, integrity_version
+                    detected_links, word_count, integrity_flag, duplicate_of_proof_id, integrity_version,
+                    review_priority, review_version, awarded_after_review
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     telegram_id,
@@ -1153,78 +1370,130 @@ def create_proof(data: ProofCreateRequest):
                     "first_submission",
                     None,
                     EXECUTION_INTEGRITY_VERSION,
+                    review_priority,
+                    REVIEW_APPEAL_VERSION,
+                    0,
                 )
             )
 
-            new_xp = int(user["xp"]) + xp_awarded
-            new_streak = int(user["streak_days"]) + 1
-            new_verified_count = int(user["verified_proofs_count"]) + 1
-            new_stage = calculate_stage(new_streak, new_verified_count)
-
-            conn.execute(
-                """
-                UPDATE users
-                SET xp = ?, streak_days = ?, verified_proofs_count = ?,
-                    guardian_stage = ?, updated_at = ?
-                WHERE telegram_id = ?
-                """,
-                (
-                    new_xp,
-                    new_streak,
-                    new_verified_count,
-                    new_stage,
-                    now_iso(),
-                    telegram_id
+            if needs_review:
+                conn.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'under_review',
+                        lifecycle_status = 'under_review',
+                        submitted_at = ?,
+                        proof_attempts_count = proof_attempts_count + 1,
+                        integrity_status = 'pending_review',
+                        lifecycle_version = ?,
+                        updated_at = ?
+                    WHERE id = ? AND telegram_id = ?
+                    """,
+                    (created, DAILY_LIFECYCLE_VERSION, now_iso(), data.task_id, telegram_id)
                 )
-            )
 
-            conn.execute(
-                """
-                UPDATE tasks
-                SET status = 'completed',
-                    lifecycle_status = 'completed',
-                    submitted_at = ?,
-                    completed_at = ?,
-                    proof_attempts_count = proof_attempts_count + 1,
-                    integrity_status = 'completed_once',
-                    lifecycle_version = ?,
-                    updated_at = ?
-                WHERE id = ? AND telegram_id = ?
-                """,
-                (created, created, DAILY_LIFECYCLE_VERSION, now_iso(), data.task_id, telegram_id)
-            )
-
-            conn.execute(
-                """
-                INSERT INTO progression_events (
-                    telegram_id, event_type, xp_delta, old_stage, new_stage, metadata, created_at
+                conn.execute(
+                    """
+                    INSERT INTO progression_events (
+                        telegram_id, event_type, xp_delta, old_stage, new_stage, metadata, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        telegram_id,
+                        "proof_needs_review",
+                        0,
+                        old_stage,
+                        old_stage,
+                        f"task_id={data.task_id};proof_score={proof_validation['proof_quality_score']};priority={review_priority}",
+                        now_iso()
+                    )
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    telegram_id,
-                    "proof_submitted",
-                    xp_awarded,
-                    old_stage,
-                    new_stage,
-                    f"task_id={data.task_id};review_status={proof_validation['review_status']};proof_score={proof_validation['proof_quality_score']}",
-                    now_iso()
+
+                conn.commit()
+
+                proof = conn.execute(
+                    "SELECT * FROM proofs WHERE id = ?",
+                    (cursor.lastrowid,)
+                ).fetchone()
+
+                updated_user = conn.execute(
+                    "SELECT * FROM users WHERE telegram_id = ?",
+                    (telegram_id,)
+                ).fetchone()
+
+            else:
+                new_xp = int(user["xp"]) + xp_awarded
+                new_streak = int(user["streak_days"]) + 1
+                new_verified_count = int(user["verified_proofs_count"]) + 1
+                new_stage = calculate_stage(new_streak, new_verified_count)
+
+                conn.execute(
+                    """
+                    UPDATE users
+                    SET xp = ?, streak_days = ?, verified_proofs_count = ?,
+                        guardian_stage = ?, updated_at = ?
+                    WHERE telegram_id = ?
+                    """,
+                    (
+                        new_xp,
+                        new_streak,
+                        new_verified_count,
+                        new_stage,
+                        now_iso(),
+                        telegram_id
+                    )
                 )
-            )
 
-            conn.commit()
+                conn.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'completed',
+                        lifecycle_status = 'completed',
+                        submitted_at = ?,
+                        completed_at = ?,
+                        proof_attempts_count = proof_attempts_count + 1,
+                        integrity_status = 'completed_once',
+                        lifecycle_version = ?,
+                        updated_at = ?
+                    WHERE id = ? AND telegram_id = ?
+                    """,
+                    (created, created, DAILY_LIFECYCLE_VERSION, now_iso(), data.task_id, telegram_id)
+                )
 
-            proof = conn.execute(
-                "SELECT * FROM proofs WHERE id = ?",
-                (cursor.lastrowid,)
-            ).fetchone()
+                conn.execute(
+                    """
+                    INSERT INTO progression_events (
+                        telegram_id, event_type, xp_delta, old_stage, new_stage, metadata, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        telegram_id,
+                        "proof_submitted",
+                        xp_awarded,
+                        old_stage,
+                        new_stage,
+                        f"task_id={data.task_id};review_status={proof_validation['review_status']};proof_score={proof_validation['proof_quality_score']}",
+                        now_iso()
+                    )
+                )
 
-            updated_user = conn.execute(
-                "SELECT * FROM users WHERE telegram_id = ?",
-                (telegram_id,)
-            ).fetchone()
+                conn.commit()
+
+                proof = conn.execute(
+                    "SELECT * FROM proofs WHERE id = ?",
+                    (cursor.lastrowid,)
+                ).fetchone()
+
+                updated_user = conn.execute(
+                    "SELECT * FROM users WHERE telegram_id = ?",
+                    (telegram_id,)
+                ).fetchone()
 
     proof_message_title = "✅ اثبات قرارداد ثبت شد."
+    if proof_validation.get("review_status") == "needs_review":
+        proof_message_title = "🟡 اثبات ثبت شد و در صف بررسی قرار گرفت."
     if proof_validation.get("review_status") == "duplicate_submission":
         proof_message_title = "⚠️ ثبت نشد؛ ثبت تکراری معتبر نیست."
 
@@ -1434,6 +1703,423 @@ def proofs_history(telegram_id: str, limit: int = 20):
 
 
 
+
+@app.get("/review/queue")
+def review_queue(limit: int = 20):
+    limit = max(1, min(int(limit or 20), 100))
+
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                p.*,
+                t.title AS contract_title,
+                t.done_definition AS contract_done_definition,
+                t.deadline AS contract_deadline,
+                t.estimated_minutes AS contract_estimated_minutes,
+                u.first_name AS user_first_name,
+                u.username AS user_username
+            FROM proofs p
+            JOIN tasks t ON t.id = p.task_id
+            LEFT JOIN users u ON u.telegram_id = p.telegram_id
+            WHERE p.review_status = 'needs_review'
+            ORDER BY p.review_priority DESC, p.created_at ASC
+            LIMIT ?
+            """,
+            (limit,)
+        ).fetchall()
+
+    return {
+        "ok": True,
+        "review_version": REVIEW_APPEAL_VERSION,
+        "items": [row_to_dict(row) for row in rows]
+    }
+
+
+@app.post("/review/decision")
+def review_decision(data: ReviewDecisionRequest):
+    decision = data.decision.strip().lower()
+    if decision not in {"accepted", "rejected", "needs_revision"}:
+        raise HTTPException(status_code=400, detail="تصمیم review نامعتبر است")
+
+    reviewer_id = data.reviewer_id.strip() or "admin"
+    note = (data.note or "").strip()
+
+    with get_db() as conn:
+        proof = conn.execute(
+            "SELECT * FROM proofs WHERE id = ?",
+            (data.proof_id,)
+        ).fetchone()
+
+        if proof is None:
+            raise HTTPException(status_code=404, detail="اثبات پیدا نشد")
+
+        task = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?",
+            (proof["task_id"],)
+        ).fetchone()
+
+        if task is None:
+            raise HTTPException(status_code=404, detail="قرارداد پیدا نشد")
+
+        if decision == "accepted":
+            result = apply_review_award(
+                conn,
+                proof=proof,
+                task=task,
+                reviewer_id=reviewer_id,
+                note=note or "Proof accepted by reviewer.",
+                xp_award=data.xp_award,
+                event_type="review_accepted",
+                accepted_status="accepted",
+            )
+            conn.commit()
+
+            send_bot_message(
+                proof["telegram_id"],
+                (
+                    "✅ اثبات پس از بررسی پذیرفته شد.\n\n"
+                    f"عنوان قرارداد: {task['title']}\n"
+                    f"امتیاز افزوده‌شده: {result.get('xp_awarded', 0)}\n"
+                    f"یادداشت بررسی: {note or '—'}"
+                )
+            )
+
+            return {
+                "ok": True,
+                "decision": decision,
+                "result": result
+            }
+
+        reviewed_at = now_iso()
+        new_task_status = "active"
+        new_lifecycle_status = "active"
+        integrity_status = "review_rejected_resubmission_allowed" if decision == "rejected" else "needs_revision_resubmission_allowed"
+
+        conn.execute(
+            """
+            UPDATE proofs
+            SET status = ?,
+                review_status = ?,
+                review_decision = ?,
+                reviewer_id = ?,
+                reviewer_note = ?,
+                reviewed_at = ?,
+                review_version = ?
+            WHERE id = ?
+            """,
+            (
+                decision,
+                decision,
+                decision,
+                reviewer_id,
+                note,
+                reviewed_at,
+                REVIEW_APPEAL_VERSION,
+                data.proof_id,
+            )
+        )
+
+        conn.execute(
+            """
+            UPDATE tasks
+            SET status = ?,
+                lifecycle_status = ?,
+                integrity_status = ?,
+                lifecycle_version = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                new_task_status,
+                new_lifecycle_status,
+                integrity_status,
+                DAILY_LIFECYCLE_VERSION,
+                reviewed_at,
+                task["id"],
+            )
+        )
+
+        conn.execute(
+            """
+            INSERT INTO progression_events (
+                telegram_id, event_type, xp_delta, old_stage, new_stage, metadata, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                proof["telegram_id"],
+                f"review_{decision}",
+                0,
+                None,
+                None,
+                f"proof_id={proof['id']};task_id={task['id']};reviewer_id={reviewer_id}",
+                reviewed_at,
+            )
+        )
+
+        conn.commit()
+
+    label = "رد شد" if decision == "rejected" else "نیازمند اصلاح شد"
+    send_bot_message(
+        proof["telegram_id"],
+        (
+            f"⚠️ نتیجه بررسی: اثبات {label}.\n\n"
+            f"عنوان قرارداد: {task['title']}\n"
+            f"یادداشت بررسی: {note or '—'}\n"
+            "می‌توانی اثبات اصلاح‌شده ارسال کنی یا اگر رد شده، اعتراض ثبت کنی."
+        )
+    )
+
+    return {
+        "ok": True,
+        "decision": decision,
+        "message": f"review decision saved: {decision}"
+    }
+
+
+@app.post("/appeals")
+def create_appeal(data: AppealCreateRequest):
+    telegram_id = data.telegram_id.strip()
+    appeal_text = data.appeal_text.strip()
+
+    if not telegram_id:
+        raise HTTPException(status_code=400, detail="شناسه تلگرام الزامی است")
+    if not appeal_text:
+        raise HTTPException(status_code=400, detail="متن اعتراض الزامی است")
+
+    with get_db() as conn:
+        proof = conn.execute(
+            "SELECT * FROM proofs WHERE id = ? AND telegram_id = ?",
+            (data.proof_id, telegram_id)
+        ).fetchone()
+
+        if proof is None:
+            raise HTTPException(status_code=404, detail="اثبات پیدا نشد")
+
+        if proof["review_status"] not in {"rejected", "needs_revision"}:
+            raise HTTPException(status_code=400, detail="برای این اثبات امکان اعتراض فعال نیست")
+
+        existing = conn.execute(
+            """
+            SELECT * FROM proof_appeals
+            WHERE proof_id = ? AND status = 'open'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (data.proof_id,)
+        ).fetchone()
+
+        if existing is not None:
+            return {
+                "ok": False,
+                "code": "appeal_already_open",
+                "message": "برای این اثبات قبلاً یک اعتراض باز ثبت شده است.",
+                "appeal": row_to_dict(existing)
+            }
+
+        created = now_iso()
+        cursor = conn.execute(
+            """
+            INSERT INTO proof_appeals (
+                telegram_id, proof_id, task_id, appeal_text, status, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (telegram_id, data.proof_id, proof["task_id"], appeal_text, "open", created)
+        )
+
+        conn.execute(
+            """
+            INSERT INTO progression_events (
+                telegram_id, event_type, xp_delta, old_stage, new_stage, metadata, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                telegram_id,
+                "appeal_created",
+                0,
+                None,
+                None,
+                f"proof_id={data.proof_id};appeal_id={cursor.lastrowid}",
+                created,
+            )
+        )
+
+        conn.commit()
+
+        appeal = conn.execute(
+            "SELECT * FROM proof_appeals WHERE id = ?",
+            (cursor.lastrowid,)
+        ).fetchone()
+
+    send_bot_message(
+        telegram_id,
+        (
+            "📨 اعتراض ثبت شد و در صف بررسی قرار گرفت.\n\n"
+            f"شناسه اثبات: {data.proof_id}"
+        )
+    )
+
+    return {
+        "ok": True,
+        "appeal": row_to_dict(appeal)
+    }
+
+
+@app.get("/appeals/queue")
+def appeals_queue(limit: int = 20):
+    limit = max(1, min(int(limit or 20), 100))
+
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                a.*,
+                p.proof_text,
+                p.review_status,
+                t.title AS contract_title
+            FROM proof_appeals a
+            JOIN proofs p ON p.id = a.proof_id
+            JOIN tasks t ON t.id = a.task_id
+            WHERE a.status = 'open'
+            ORDER BY a.created_at ASC
+            LIMIT ?
+            """,
+            (limit,)
+        ).fetchall()
+
+    return {
+        "ok": True,
+        "review_version": REVIEW_APPEAL_VERSION,
+        "appeals": [row_to_dict(row) for row in rows]
+    }
+
+
+@app.post("/appeals/resolve")
+def resolve_appeal(data: AppealResolveRequest):
+    decision = data.decision.strip().lower()
+    if decision not in {"accepted", "denied"}:
+        raise HTTPException(status_code=400, detail="تصمیم اعتراض نامعتبر است")
+
+    reviewer_id = data.reviewer_id.strip() or "admin"
+    resolution_note = (data.resolution_note or "").strip()
+
+    with get_db() as conn:
+        appeal = conn.execute(
+            "SELECT * FROM proof_appeals WHERE id = ?",
+            (data.appeal_id,)
+        ).fetchone()
+
+        if appeal is None:
+            raise HTTPException(status_code=404, detail="اعتراض پیدا نشد")
+
+        if appeal["status"] != "open":
+            return {
+                "ok": False,
+                "code": "appeal_already_resolved",
+                "message": "این اعتراض قبلاً تعیین تکلیف شده است.",
+                "appeal": row_to_dict(appeal)
+            }
+
+        proof = conn.execute(
+            "SELECT * FROM proofs WHERE id = ?",
+            (appeal["proof_id"],)
+        ).fetchone()
+        task = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?",
+            (appeal["task_id"],)
+        ).fetchone()
+
+        if proof is None or task is None:
+            raise HTTPException(status_code=404, detail="اثبات یا قرارداد مرتبط پیدا نشد")
+
+        resolved_at = now_iso()
+
+        if decision == "accepted":
+            result = apply_review_award(
+                conn,
+                proof=proof,
+                task=task,
+                reviewer_id=reviewer_id,
+                note=resolution_note or "Appeal accepted.",
+                xp_award=data.xp_award,
+                event_type="appeal_accepted",
+                accepted_status="accepted_after_appeal",
+            )
+        else:
+            result = {
+                "awarded": False,
+                "xp_awarded": 0,
+            }
+
+        conn.execute(
+            """
+            UPDATE proof_appeals
+            SET status = ?,
+                reviewer_id = ?,
+                resolution_note = ?,
+                resolved_at = ?
+            WHERE id = ?
+            """,
+            (
+                decision,
+                reviewer_id,
+                resolution_note,
+                resolved_at,
+                data.appeal_id,
+            )
+        )
+
+        if decision == "denied":
+            conn.execute(
+                """
+                INSERT INTO progression_events (
+                    telegram_id, event_type, xp_delta, old_stage, new_stage, metadata, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    appeal["telegram_id"],
+                    "appeal_denied",
+                    0,
+                    None,
+                    None,
+                    f"appeal_id={appeal['id']};proof_id={proof['id']}",
+                    resolved_at,
+                )
+            )
+
+        conn.commit()
+
+    if decision == "accepted":
+        send_bot_message(
+            appeal["telegram_id"],
+            (
+                "✅ اعتراض پذیرفته شد.\n\n"
+                f"عنوان قرارداد: {task['title']}\n"
+                f"امتیاز افزوده‌شده: {result.get('xp_awarded', 0)}\n"
+                f"یادداشت: {resolution_note or '—'}"
+            )
+        )
+    else:
+        send_bot_message(
+            appeal["telegram_id"],
+            (
+                "⚠️ اعتراض رد شد.\n\n"
+                f"عنوان قرارداد: {task['title']}\n"
+                f"یادداشت: {resolution_note or '—'}"
+            )
+        )
+
+    return {
+        "ok": True,
+        "decision": decision,
+        "result": result
+    }
+
+
 @app.get("/execution/integrity")
 def execution_integrity(telegram_id: str):
     telegram_id = telegram_id.strip()
@@ -1510,11 +2196,13 @@ def debug_state():
         tasks = [row_to_dict(r) for r in conn.execute("SELECT * FROM tasks ORDER BY id DESC").fetchall()]
         proofs = [row_to_dict(r) for r in conn.execute("SELECT * FROM proofs ORDER BY id DESC").fetchall()]
         events = [row_to_dict(r) for r in conn.execute("SELECT * FROM progression_events ORDER BY id DESC").fetchall()]
+        appeals = [row_to_dict(r) for r in conn.execute("SELECT * FROM proof_appeals ORDER BY id DESC").fetchall()]
 
     return {
         "ok": True,
         "users": users,
         "tasks": tasks,
         "proofs": proofs,
+        "appeals": appeals,
         "events": events
     }
