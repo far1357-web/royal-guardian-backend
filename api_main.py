@@ -16,6 +16,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 V36C_VALIDATION_VERSION = "v36c-contract-validation-lite-1"
 PROOF_CORE_VERSION = "v36c-proof-core-lite-1"
 EXECUTION_INTEGRITY_VERSION = "v36c-execution-integrity-lite-1"
+DAILY_LIFECYCLE_VERSION = "v36c-daily-lifecycle-lite-1"
 
 VALID_PROOF_TYPE_MAP = {
     "text": "text",
@@ -44,7 +45,7 @@ AMBIGUOUS_PREFIXES = (
 
 app = FastAPI(
     title="Royal Guardian Backend",
-    version="0.7.0-execution-integrity-v1"
+    version="0.8.0-daily-lifecycle-v1"
 )
 
 app.add_middleware(
@@ -58,6 +59,10 @@ app.add_middleware(
 
 def now_iso() -> str:
     return datetime.utcnow().isoformat()
+
+
+def today_iso_date() -> str:
+    return datetime.utcnow().date().isoformat()
 
 
 def get_db():
@@ -417,6 +422,90 @@ def review_status_label_fa(status: str) -> str:
         "rejected": "رد شده",
     }.get(str(status), "نامشخص")
 
+
+def build_task_lifecycle(conn: sqlite3.Connection, task_row) -> Dict[str, Any]:
+    task = row_to_dict(task_row)
+    if not task:
+        return {
+            "lifecycle_version": DAILY_LIFECYCLE_VERSION,
+            "has_contract": False,
+            "can_submit_proof": False,
+            "needs_new_contract": True,
+            "state": "empty",
+            "message": "برای امروز هنوز قراردادی ثبت نشده است."
+        }
+
+    proof_count = conn.execute(
+        "SELECT COUNT(*) AS count FROM proofs WHERE task_id = ?",
+        (task["id"],)
+    ).fetchone()["count"]
+
+    status = str(task.get("status") or "active")
+    integrity_status = str(task.get("integrity_status") or "open")
+
+    is_completed = status == "completed" or integrity_status == "completed_once" or proof_count > 0
+    is_active = status == "active" and not is_completed
+
+    if is_completed:
+        state = "completed"
+        can_submit = False
+        needs_new = True
+        message = "قرارداد قبلی کامل شده است. برای اجرای بعدی، قرارداد تازه بساز."
+    elif is_active:
+        state = "active"
+        can_submit = True
+        needs_new = False
+        message = "قرارداد فعال است و هنوز اثبات معتبر ثبت نشده است."
+    else:
+        state = status
+        can_submit = False
+        needs_new = True
+        message = "این قرارداد بسته شده است. برای ادامه، قرارداد تازه بساز."
+
+    return {
+        "lifecycle_version": DAILY_LIFECYCLE_VERSION,
+        "has_contract": True,
+        "state": state,
+        "status": status,
+        "integrity_status": integrity_status,
+        "can_submit_proof": can_submit,
+        "needs_new_contract": needs_new,
+        "proof_count": proof_count,
+        "execution_date": task.get("execution_date"),
+        "submitted_at": task.get("submitted_at"),
+        "completed_at": task.get("completed_at"),
+        "message": message
+    }
+
+
+def close_previous_active_contracts(conn: sqlite3.Connection, telegram_id: str) -> int:
+    rows = conn.execute(
+        """
+        SELECT id FROM tasks
+        WHERE telegram_id = ? AND status = 'active'
+        """,
+        (telegram_id,)
+    ).fetchall()
+
+    if not rows:
+        return 0
+
+    conn.execute(
+        """
+        UPDATE tasks
+        SET status = 'superseded',
+            lifecycle_status = 'superseded',
+            integrity_status = 'superseded_by_new_contract',
+            closed_at = ?,
+            close_reason = 'replaced_by_new_contract',
+            updated_at = ?
+        WHERE telegram_id = ? AND status = 'active'
+        """,
+        (now_iso(), now_iso(), telegram_id)
+    )
+
+    return len(rows)
+
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
     """
     مهاجرت ساده SQLite: اگر ستون وجود نداشت، اضافه می‌شود.
@@ -522,6 +611,11 @@ def init_db():
         ensure_column(conn, "tasks", "completed_at", "TEXT")
         ensure_column(conn, "tasks", "integrity_status", "TEXT NOT NULL DEFAULT 'open'")
         ensure_column(conn, "tasks", "proof_attempts_count", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "tasks", "execution_date", "TEXT")
+        ensure_column(conn, "tasks", "lifecycle_status", "TEXT NOT NULL DEFAULT 'active'")
+        ensure_column(conn, "tasks", "closed_at", "TEXT")
+        ensure_column(conn, "tasks", "close_reason", "TEXT")
+        ensure_column(conn, "tasks", "lifecycle_version", "TEXT")
 
         conn.commit()
 
@@ -565,7 +659,7 @@ def root():
         "status": "ok",
         "message": "Royal Guardian backend is running",
         "database": DB_PATH,
-        "version": "0.7.0-execution-integrity-v1"
+        "version": "0.8.0-daily-lifecycle-v1"
     }
 
 
@@ -576,7 +670,7 @@ def health():
         "time": now_iso(),
         "database": DB_PATH,
         "bot_token_configured": bool(BOT_TOKEN),
-        "version": "0.7.0-execution-integrity-v1"
+        "version": "0.8.0-daily-lifecycle-v1"
     }
 
 
@@ -693,6 +787,8 @@ def create_contract_record(data: TaskCreateRequest):
     with get_db() as conn:
         ensure_user_exists(conn, telegram_id)
 
+        close_previous_active_contracts(conn, telegram_id)
+
         created = now_iso()
         cursor = conn.execute(
             """
@@ -700,9 +796,10 @@ def create_contract_record(data: TaskCreateRequest):
                 telegram_id, title, deadline, proof_type, status, created_at, updated_at,
                 done_definition, if_then_trigger, if_then_action, micro_fallback,
                 estimated_minutes, contract_type, difficulty, source,
-                normalized_proof_type, contract_quality_score, predicted_risk, validation_status, validation_notes, validation_version
+                normalized_proof_type, contract_quality_score, predicted_risk, validation_status, validation_notes, validation_version,
+                execution_date, lifecycle_status, lifecycle_version
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 telegram_id,
@@ -725,7 +822,10 @@ def create_contract_record(data: TaskCreateRequest):
                 validation["predicted_risk"],
                 validation["validation_status"],
                 validation["validation_notes"],
-                validation["validation_version"]
+                validation["validation_version"],
+                today_iso_date(),
+                "active",
+                DAILY_LIFECYCLE_VERSION
             )
         )
         conn.commit()
@@ -752,11 +852,15 @@ def create_contract_record(data: TaskCreateRequest):
         )
     )
 
+    with get_db() as conn:
+        lifecycle = build_task_lifecycle(conn, task)
+
     task_dict = row_to_dict(task)
     return {
         "ok": True,
         "task": task_dict,
-        "contract": task_dict
+        "contract": task_dict,
+        "lifecycle": lifecycle
     }
 
 
@@ -818,9 +922,10 @@ def get_today(telegram_id: str):
                 INSERT INTO tasks (
                     telegram_id, title, deadline, proof_type, status, created_at, updated_at,
                     done_definition, if_then_trigger, if_then_action, micro_fallback,
-                    estimated_minutes, contract_type, difficulty, source
+                    estimated_minutes, contract_type, difficulty, source,
+                    execution_date, lifecycle_status, lifecycle_version
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     telegram_id,
@@ -837,7 +942,10 @@ def get_today(telegram_id: str):
                     30,
                     "execution_contract",
                     "normal",
-                    "auto_seed"
+                    "auto_seed",
+                    today_iso_date(),
+                    "active",
+                    DAILY_LIFECYCLE_VERSION
                 )
             )
             conn.commit()
@@ -847,11 +955,15 @@ def get_today(telegram_id: str):
                 (task_id,)
             ).fetchone()
 
+    with get_db() as conn:
+        lifecycle = build_task_lifecycle(conn, task)
+
     task_dict = row_to_dict(task)
     return {
         "ok": True,
         "task": task_dict,
-        "contract": task_dict
+        "contract": task_dict,
+        "lifecycle": lifecycle
     }
 
 
@@ -958,7 +1070,7 @@ def create_proof(data: ProofCreateRequest):
                 "proof_quality_score": existing_proof["proof_quality_score"] if "proof_quality_score" in existing_proof.keys() else 0,
                 "proof_risk": existing_proof["proof_risk"] if "proof_risk" in existing_proof.keys() else "medium",
                 "proof_validation_status": "duplicate_submission",
-                "proof_validation_notes": "برای این قرارداد قبلاً اثبات ثبت شده است. امتیاز و زنجیره دوباره اضافه نشد.",
+                "proof_validation_notes": "ثبت نشد؛ ثبت تکراری معتبر نیست. برای این قرارداد قبلاً اثبات ثبت شده است و امتیاز یا زنجیره دوباره اضافه نشد.",
                 "proof_validation_version": PROOF_CORE_VERSION,
                 "review_status": "duplicate_submission",
                 "quality_note": "Duplicate proof blocked by Execution Integrity V1.",
@@ -967,49 +1079,16 @@ def create_proof(data: ProofCreateRequest):
                 "word_count": count_words_loose(proof_text),
             }
 
-            cursor = conn.execute(
-                """
-                INSERT INTO proofs (
-                    telegram_id, task_id, proof_text, status, created_at,
-                    review_status, quality_note, xp_awarded,
-                    proof_kind, proof_quality_score, proof_risk,
-                    proof_validation_status, proof_validation_notes, proof_validation_version,
-                    detected_links, word_count, integrity_flag, duplicate_of_proof_id, integrity_version
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    telegram_id,
-                    data.task_id,
-                    proof_text,
-                    "duplicate",
-                    created,
-                    proof_validation["review_status"],
-                    proof_validation["quality_note"],
-                    0,
-                    proof_validation["proof_kind"],
-                    proof_validation["proof_quality_score"],
-                    proof_validation["proof_risk"],
-                    proof_validation["proof_validation_status"],
-                    proof_validation["proof_validation_notes"],
-                    proof_validation["proof_validation_version"],
-                    proof_validation["detected_links"],
-                    proof_validation["word_count"],
-                    "duplicate_blocked",
-                    existing_proof["id"],
-                    EXECUTION_INTEGRITY_VERSION,
-                )
-            )
-
             conn.execute(
                 """
                 UPDATE tasks
                 SET proof_attempts_count = proof_attempts_count + 1,
                     integrity_status = 'duplicate_attempt_blocked',
+                    lifecycle_version = ?,
                     updated_at = ?
                 WHERE id = ? AND telegram_id = ?
                 """,
-                (now_iso(), data.task_id, telegram_id)
+                (DAILY_LIFECYCLE_VERSION, now_iso(), data.task_id, telegram_id)
             )
 
             conn.execute(
@@ -1025,17 +1104,14 @@ def create_proof(data: ProofCreateRequest):
                     0,
                     old_stage,
                     old_stage,
-                    f"task_id={data.task_id};duplicate_of_proof_id={existing_proof['id']}",
+                    f"task_id={data.task_id};duplicate_of_proof_id={existing_proof['id']};not_registered=true",
                     now_iso()
                 )
             )
 
             conn.commit()
 
-            proof = conn.execute(
-                "SELECT * FROM proofs WHERE id = ?",
-                (cursor.lastrowid,)
-            ).fetchone()
+            proof = None
 
             updated_user = conn.execute(
                 "SELECT * FROM users WHERE telegram_id = ?",
@@ -1106,14 +1182,16 @@ def create_proof(data: ProofCreateRequest):
                 """
                 UPDATE tasks
                 SET status = 'completed',
+                    lifecycle_status = 'completed',
                     submitted_at = ?,
                     completed_at = ?,
                     proof_attempts_count = proof_attempts_count + 1,
                     integrity_status = 'completed_once',
+                    lifecycle_version = ?,
                     updated_at = ?
                 WHERE id = ? AND telegram_id = ?
                 """,
-                (created, created, now_iso(), data.task_id, telegram_id)
+                (created, created, DAILY_LIFECYCLE_VERSION, now_iso(), data.task_id, telegram_id)
             )
 
             conn.execute(
@@ -1148,7 +1226,7 @@ def create_proof(data: ProofCreateRequest):
 
     proof_message_title = "✅ اثبات قرارداد ثبت شد."
     if proof_validation.get("review_status") == "duplicate_submission":
-        proof_message_title = "⚠️ اثبات تکراری ثبت شد؛ امتیاز دوباره اضافه نشد."
+        proof_message_title = "⚠️ ثبت نشد؛ ثبت تکراری معتبر نیست."
 
     send_bot_message(
         telegram_id,
@@ -1166,12 +1244,24 @@ def create_proof(data: ProofCreateRequest):
         )
     )
 
+    is_duplicate = proof_validation.get("review_status") == "duplicate_submission"
+
+    with get_db() as conn:
+        refreshed_task = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?",
+            (data.task_id,)
+        ).fetchone()
+        lifecycle = build_task_lifecycle(conn, refreshed_task)
+
     return {
-        "ok": True,
+        "ok": not is_duplicate,
+        "code": "duplicate_proof" if is_duplicate else "proof_submitted",
+        "message": "ثبت نشد؛ ثبت تکراری معتبر نیست." if is_duplicate else "اثبات قرارداد ثبت شد.",
         "proof": row_to_dict(proof),
         "proof_validation": proof_validation,
         "user": row_to_dict(updated_user),
-        "contract": row_to_dict(task)
+        "contract": row_to_dict(refreshed_task),
+        "lifecycle": lifecycle
     }
 
 
@@ -1202,6 +1292,61 @@ def get_progress(telegram_id: str):
             "verified_proofs_count": user["verified_proofs_count"]
         }
     }
+
+
+
+@app.get("/lifecycle/today")
+def lifecycle_today(telegram_id: str):
+    telegram_id = telegram_id.strip()
+    if not telegram_id:
+        raise HTTPException(status_code=400, detail="شناسه تلگرام الزامی است")
+
+    with get_db() as conn:
+        task = conn.execute(
+            """
+            SELECT * FROM tasks
+            WHERE telegram_id = ? AND status = 'active'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (telegram_id,)
+        ).fetchone()
+
+        if task is None:
+            task = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE telegram_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (telegram_id,)
+            ).fetchone()
+
+        lifecycle = build_task_lifecycle(conn, task)
+
+        user = conn.execute(
+            "SELECT * FROM users WHERE telegram_id = ?",
+            (telegram_id,)
+        ).fetchone()
+
+    return {
+        "ok": True,
+        "contract": row_to_dict(task),
+        "task": row_to_dict(task),
+        "lifecycle": lifecycle,
+        "progress": {
+            "xp": user["xp"],
+            "streak_days": user["streak_days"],
+            "guardian_stage": user["guardian_stage"],
+            "verified_proofs_count": user["verified_proofs_count"]
+        } if user else None
+    }
+
+
+@app.get("/contracts/current")
+def contracts_current(telegram_id: str):
+    return lifecycle_today(telegram_id)
 
 
 @app.get("/contracts/latest-validation")
@@ -1311,8 +1456,8 @@ def execution_integrity(telegram_id: str):
         duplicate_count = conn.execute(
             """
             SELECT COUNT(*) AS count
-            FROM proofs
-            WHERE telegram_id = ? AND integrity_flag = 'duplicate_blocked'
+            FROM progression_events
+            WHERE telegram_id = ? AND event_type = 'duplicate_proof_blocked'
             """,
             (telegram_id,)
         ).fetchone()["count"]
