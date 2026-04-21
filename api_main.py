@@ -2,6 +2,7 @@ from datetime import datetime
 from typing import Optional, Dict, Any
 import os
 import re
+import secrets
 import sqlite3
 import urllib.parse
 import urllib.request
@@ -28,6 +29,7 @@ EXECUTION_INTEGRITY_VERSION = "v36c-execution-integrity-lite-1"
 DAILY_LIFECYCLE_VERSION = "v36c-daily-lifecycle-lite-1"
 REVIEW_APPEAL_VERSION = "v36c-review-appeal-lite-1"
 DASHBOARD_TIMELINE_VERSION = "v36c-dashboard-timeline-lite-1"
+TEAM_WITNESS_VERSION = "v36c-team-witness-lite-1"
 
 VALID_PROOF_TYPE_MAP = {
     "text": "text",
@@ -56,7 +58,7 @@ AMBIGUOUS_PREFIXES = (
 
 app = FastAPI(
     title="Royal Guardian Backend",
-    version="0.11.0-postgres-persistence-v1"
+    version="0.12.0-team-witness-v1"
 )
 
 app.add_middleware(
@@ -113,7 +115,7 @@ class PostgresConnection:
 
         lastrowid = None
         table = _insert_table_name(sql)
-        if table in {"tasks", "proofs", "progression_events", "proof_appeals"}:
+        if table in {"tasks", "proofs", "progression_events", "proof_appeals", "teams", "team_members", "witness_requests"}:
             # PostgreSQL sequence value for the last INSERT in this connection.
             # Used to preserve sqlite-style cursor.lastrowid behavior.
             seq_cur = self._conn.cursor()
@@ -849,6 +851,46 @@ def create_base_tables_postgres(conn) -> None:
         )
     """)
 
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS teams (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            owner_telegram_id TEXT NOT NULL REFERENCES users (telegram_id),
+            invite_code TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS team_members (
+            id SERIAL PRIMARY KEY,
+            team_id INTEGER NOT NULL REFERENCES teams (id),
+            telegram_id TEXT NOT NULL REFERENCES users (telegram_id),
+            role TEXT NOT NULL DEFAULT 'member',
+            status TEXT NOT NULL DEFAULT 'active',
+            joined_at TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS witness_requests (
+            id SERIAL PRIMARY KEY,
+            telegram_id TEXT NOT NULL REFERENCES users (telegram_id),
+            proof_id INTEGER NOT NULL REFERENCES proofs (id),
+            task_id INTEGER NOT NULL REFERENCES tasks (id),
+            witness_telegram_id TEXT NOT NULL,
+            witness_note TEXT,
+            requester_note TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            decision TEXT,
+            created_at TEXT NOT NULL,
+            responded_at TEXT
+        )
+    """)
+
 
 def create_base_tables_sqlite(conn) -> None:
     conn.execute("""
@@ -924,6 +966,52 @@ def create_base_tables_sqlite(conn) -> None:
         )
     """)
 
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS teams (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            owner_telegram_id TEXT NOT NULL,
+            invite_code TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (owner_telegram_id) REFERENCES users (telegram_id)
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS team_members (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team_id INTEGER NOT NULL,
+            telegram_id TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'member',
+            status TEXT NOT NULL DEFAULT 'active',
+            joined_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (team_id) REFERENCES teams (id),
+            FOREIGN KEY (telegram_id) REFERENCES users (telegram_id)
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS witness_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id TEXT NOT NULL,
+            proof_id INTEGER NOT NULL,
+            task_id INTEGER NOT NULL,
+            witness_telegram_id TEXT NOT NULL,
+            witness_note TEXT,
+            requester_note TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            decision TEXT,
+            created_at TEXT NOT NULL,
+            responded_at TEXT,
+            FOREIGN KEY (telegram_id) REFERENCES users (telegram_id),
+            FOREIGN KEY (proof_id) REFERENCES proofs (id),
+            FOREIGN KEY (task_id) REFERENCES tasks (id)
+        )
+    """)
+
 
 def init_db():
     with get_db() as conn:
@@ -978,6 +1066,8 @@ def init_db():
         ensure_column(conn, "proofs", "review_decision", "TEXT")
         ensure_column(conn, "proofs", "review_version", "TEXT")
         ensure_column(conn, "proofs", "awarded_after_review", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "proofs", "witness_status", "TEXT NOT NULL DEFAULT 'none'")
+        ensure_column(conn, "proofs", "witness_confirmed_count", "INTEGER NOT NULL DEFAULT 0")
 
         conn.commit()
 
@@ -1037,6 +1127,30 @@ class AppealResolveRequest(BaseModel):
     xp_award: Optional[int] = None
 
 
+class TeamCreateRequest(BaseModel):
+    owner_telegram_id: str
+    name: str
+
+
+class TeamJoinRequest(BaseModel):
+    telegram_id: str
+    invite_code: str
+
+
+class WitnessRequestCreate(BaseModel):
+    telegram_id: str
+    proof_id: int
+    witness_telegram_id: str
+    note: Optional[str] = None
+
+
+class WitnessRespondRequest(BaseModel):
+    witness_id: int
+    witness_telegram_id: str
+    decision: str
+    note: Optional[str] = None
+
+
 @app.get("/")
 def root():
     return {
@@ -1045,7 +1159,7 @@ def root():
         "database": DB_PATH,
         "db_backend": DB_BACKEND,
         "database_url_configured": bool(DATABASE_URL),
-        "version": "0.11.0-postgres-persistence-v1"
+        "version": "0.12.0-team-witness-v1"
     }
 
 
@@ -1058,7 +1172,7 @@ def health():
         "db_backend": DB_BACKEND,
         "database_url_configured": bool(DATABASE_URL),
         "bot_token_configured": bool(BOT_TOKEN),
-        "version": "0.11.0-postgres-persistence-v1"
+        "version": "0.12.0-team-witness-v1"
     }
 
 
@@ -1071,6 +1185,9 @@ def db_status():
         proofs_count = conn.execute("SELECT COUNT(*) AS count FROM proofs").fetchone()["count"]
         appeals_count = conn.execute("SELECT COUNT(*) AS count FROM proof_appeals").fetchone()["count"]
         events_count = conn.execute("SELECT COUNT(*) AS count FROM progression_events").fetchone()["count"]
+        teams_count = conn.execute("SELECT COUNT(*) AS count FROM teams").fetchone()["count"]
+        team_members_count = conn.execute("SELECT COUNT(*) AS count FROM team_members").fetchone()["count"]
+        witness_requests_count = conn.execute("SELECT COUNT(*) AS count FROM witness_requests").fetchone()["count"]
 
     return {
         "ok": True,
@@ -1082,6 +1199,9 @@ def db_status():
             "proofs": proofs_count,
             "appeals": appeals_count,
             "events": events_count,
+            "teams": teams_count,
+            "team_members": team_members_count,
+            "witness_requests": witness_requests_count,
         }
     }
 
@@ -2201,6 +2321,553 @@ def me_history(telegram_id: str, limit: int = 20):
     }
 
 
+
+def make_invite_code(conn) -> str:
+    for _ in range(12):
+        code = "RG-" + secrets.token_hex(3).upper()
+        existing = conn.execute(
+            "SELECT id FROM teams WHERE invite_code = ? LIMIT 1",
+            (code,)
+        ).fetchone()
+        if existing is None:
+            return code
+    return "RG-" + secrets.token_hex(5).upper()
+
+
+def get_active_team_for_user(conn, telegram_id: str):
+    return conn.execute(
+        """
+        SELECT
+            t.*,
+            tm.role AS member_role,
+            tm.status AS member_status,
+            tm.joined_at AS member_joined_at
+        FROM teams t
+        JOIN team_members tm ON tm.team_id = t.id
+        WHERE tm.telegram_id = ?
+          AND tm.status = 'active'
+          AND t.status = 'active'
+        ORDER BY tm.id DESC
+        LIMIT 1
+        """,
+        (telegram_id,)
+    ).fetchone()
+
+
+@app.post("/teams")
+def create_team(data: TeamCreateRequest):
+    owner_id = data.owner_telegram_id.strip()
+    name = data.name.strip()
+
+    if not owner_id:
+        raise HTTPException(status_code=400, detail="شناسه مالک تیم الزامی است")
+    if not name:
+        raise HTTPException(status_code=400, detail="نام تیم الزامی است")
+
+    with get_db() as conn:
+        ensure_user_exists(conn, owner_id)
+
+        existing_team = get_active_team_for_user(conn, owner_id)
+        if existing_team is not None:
+            return {
+                "ok": False,
+                "code": "already_in_team",
+                "message": "این کاربر همین حالا عضو یک تیم فعال است.",
+                "team": row_to_dict(existing_team)
+            }
+
+        created = now_iso()
+        invite_code = make_invite_code(conn)
+        cursor = conn.execute(
+            """
+            INSERT INTO teams (
+                name, owner_telegram_id, invite_code, status, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (name, owner_id, invite_code, "active", created, created)
+        )
+        team_id = cursor.lastrowid
+
+        conn.execute(
+            """
+            INSERT INTO team_members (
+                team_id, telegram_id, role, status, joined_at, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (team_id, owner_id, "owner", "active", created, created)
+        )
+
+        conn.execute(
+            """
+            INSERT INTO progression_events (
+                telegram_id, event_type, xp_delta, old_stage, new_stage, metadata, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                owner_id,
+                "team_created",
+                0,
+                None,
+                None,
+                f"team_id={team_id};invite_code={invite_code}",
+                created,
+            )
+        )
+
+        conn.commit()
+        team = conn.execute("SELECT * FROM teams WHERE id = ?", (team_id,)).fetchone()
+
+    send_bot_message(
+        owner_id,
+        (
+            "🛡 تیم اجرایی ساخته شد.\n\n"
+            f"نام تیم: {name}\n"
+            f"کد دعوت: {invite_code}\n"
+            "این کد را فقط به اعضای مورد اعتماد بده."
+        )
+    )
+
+    return {
+        "ok": True,
+        "team": row_to_dict(team),
+        "team_version": TEAM_WITNESS_VERSION
+    }
+
+
+@app.post("/teams/join")
+def join_team(data: TeamJoinRequest):
+    telegram_id = data.telegram_id.strip()
+    invite_code = data.invite_code.strip().upper()
+
+    if not telegram_id:
+        raise HTTPException(status_code=400, detail="شناسه تلگرام الزامی است")
+    if not invite_code:
+        raise HTTPException(status_code=400, detail="کد دعوت الزامی است")
+
+    with get_db() as conn:
+        ensure_user_exists(conn, telegram_id)
+
+        existing_team = get_active_team_for_user(conn, telegram_id)
+        if existing_team is not None:
+            return {
+                "ok": False,
+                "code": "already_in_team",
+                "message": "این کاربر همین حالا عضو یک تیم فعال است.",
+                "team": row_to_dict(existing_team)
+            }
+
+        team = conn.execute(
+            "SELECT * FROM teams WHERE invite_code = ? AND status = 'active' LIMIT 1",
+            (invite_code,)
+        ).fetchone()
+
+        if team is None:
+            raise HTTPException(status_code=404, detail="تیم با این کد دعوت پیدا نشد")
+
+        created = now_iso()
+        conn.execute(
+            """
+            INSERT INTO team_members (
+                team_id, telegram_id, role, status, joined_at, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (team["id"], telegram_id, "member", "active", created, created)
+        )
+
+        conn.execute(
+            """
+            INSERT INTO progression_events (
+                telegram_id, event_type, xp_delta, old_stage, new_stage, metadata, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                telegram_id,
+                "team_joined",
+                0,
+                None,
+                None,
+                f"team_id={team['id']};team_name={team['name']}",
+                created,
+            )
+        )
+
+        conn.commit()
+
+    send_bot_message(
+        telegram_id,
+        (
+            "✅ به تیم اجرایی پیوستی.\n\n"
+            f"نام تیم: {team['name']}"
+        )
+    )
+
+    send_bot_message(
+        team["owner_telegram_id"],
+        (
+            "👥 عضو تازه به تیم پیوست.\n\n"
+            f"شناسه تلگرام: {telegram_id}\n"
+            f"تیم: {team['name']}"
+        )
+    )
+
+    return {
+        "ok": True,
+        "team": row_to_dict(team),
+        "team_version": TEAM_WITNESS_VERSION
+    }
+
+
+@app.get("/teams/my")
+def my_team(telegram_id: str):
+    telegram_id = telegram_id.strip()
+    if not telegram_id:
+        raise HTTPException(status_code=400, detail="شناسه تلگرام الزامی است")
+
+    with get_db() as conn:
+        team = get_active_team_for_user(conn, telegram_id)
+        members = []
+        if team is not None:
+            members = [
+                row_to_dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT tm.*, u.first_name, u.username, u.xp, u.streak_days, u.guardian_stage
+                    FROM team_members tm
+                    JOIN users u ON u.telegram_id = tm.telegram_id
+                    WHERE tm.team_id = ? AND tm.status = 'active'
+                    ORDER BY tm.id ASC
+                    """,
+                    (team["id"],)
+                ).fetchall()
+            ]
+
+    return {
+        "ok": True,
+        "team": row_to_dict(team),
+        "members": members,
+        "team_version": TEAM_WITNESS_VERSION
+    }
+
+
+@app.get("/teams/leaderboard")
+def teams_leaderboard(limit: int = 20):
+    limit = max(1, min(int(limit or 20), 100))
+
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                t.id,
+                t.name,
+                t.owner_telegram_id,
+                t.invite_code,
+                COUNT(tm.id) AS member_count,
+                COALESCE(SUM(u.xp), 0) AS team_xp,
+                COALESCE(SUM(u.streak_days), 0) AS team_streak_total
+            FROM teams t
+            LEFT JOIN team_members tm ON tm.team_id = t.id AND tm.status = 'active'
+            LEFT JOIN users u ON u.telegram_id = tm.telegram_id
+            WHERE t.status = 'active'
+            GROUP BY t.id, t.name, t.owner_telegram_id, t.invite_code
+            ORDER BY team_xp DESC, team_streak_total DESC, member_count DESC
+            LIMIT ?
+            """,
+            (limit,)
+        ).fetchall()
+
+    return {
+        "ok": True,
+        "team_version": TEAM_WITNESS_VERSION,
+        "leaderboard": [row_to_dict(row) for row in rows]
+    }
+
+
+@app.post("/witness/request")
+def create_witness_request(data: WitnessRequestCreate):
+    telegram_id = data.telegram_id.strip()
+    witness_id = data.witness_telegram_id.strip()
+    note = (data.note or "").strip()
+
+    if not telegram_id:
+        raise HTTPException(status_code=400, detail="شناسه درخواست‌دهنده الزامی است")
+    if not witness_id:
+        raise HTTPException(status_code=400, detail="شناسه شاهد الزامی است")
+
+    with get_db() as conn:
+        proof = conn.execute(
+            "SELECT * FROM proofs WHERE id = ? AND telegram_id = ?",
+            (data.proof_id, telegram_id)
+        ).fetchone()
+
+        if proof is None:
+            raise HTTPException(status_code=404, detail="اثبات برای این کاربر پیدا نشد")
+
+        existing = conn.execute(
+            """
+            SELECT * FROM witness_requests
+            WHERE proof_id = ? AND witness_telegram_id = ? AND status = 'pending'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (data.proof_id, witness_id)
+        ).fetchone()
+
+        if existing is not None:
+            return {
+                "ok": False,
+                "code": "witness_request_already_pending",
+                "message": "برای این شاهد قبلاً درخواست باز ثبت شده است.",
+                "witness_request": row_to_dict(existing)
+            }
+
+        ensure_user_exists(conn, witness_id, first_name="شاهد")
+
+        created = now_iso()
+        cursor = conn.execute(
+            """
+            INSERT INTO witness_requests (
+                telegram_id, proof_id, task_id, witness_telegram_id,
+                requester_note, witness_note, status, decision, created_at, responded_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                telegram_id,
+                data.proof_id,
+                proof["task_id"],
+                witness_id,
+                note,
+                None,
+                "pending",
+                None,
+                created,
+                None,
+            )
+        )
+
+        conn.execute(
+            """
+            INSERT INTO progression_events (
+                telegram_id, event_type, xp_delta, old_stage, new_stage, metadata, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                telegram_id,
+                "witness_requested",
+                0,
+                None,
+                None,
+                f"proof_id={data.proof_id};witness_id={witness_id}",
+                created,
+            )
+        )
+
+        conn.commit()
+        witness_request = conn.execute(
+            "SELECT * FROM witness_requests WHERE id = ?",
+            (cursor.lastrowid,)
+        ).fetchone()
+
+    send_bot_message(
+        witness_id,
+        (
+            "👁 درخواست شاهد دریافت شد.\n\n"
+            f"از طرف: {telegram_id}\n"
+            f"شناسه اثبات: {data.proof_id}\n"
+            "برای پاسخ، فعلاً از endpoint /witness/respond استفاده می‌شود."
+        )
+    )
+
+    send_bot_message(
+        telegram_id,
+        (
+            "📨 درخواست شاهد ثبت شد.\n\n"
+            f"شاهد: {witness_id}\n"
+            f"شناسه اثبات: {data.proof_id}"
+        )
+    )
+
+    return {
+        "ok": True,
+        "witness_request": row_to_dict(witness_request),
+        "team_version": TEAM_WITNESS_VERSION
+    }
+
+
+@app.get("/witness/inbox")
+def witness_inbox(witness_telegram_id: str, status: str = "pending", limit: int = 20):
+    witness_telegram_id = witness_telegram_id.strip()
+    if not witness_telegram_id:
+        raise HTTPException(status_code=400, detail="شناسه شاهد الزامی است")
+
+    limit = max(1, min(int(limit or 20), 100))
+
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                wr.*,
+                p.proof_text,
+                p.review_status,
+                p.proof_quality_score,
+                t.title AS contract_title,
+                t.done_definition AS contract_done_definition
+            FROM witness_requests wr
+            JOIN proofs p ON p.id = wr.proof_id
+            JOIN tasks t ON t.id = wr.task_id
+            WHERE wr.witness_telegram_id = ? AND wr.status = ?
+            ORDER BY wr.id DESC
+            LIMIT ?
+            """,
+            (witness_telegram_id, status, limit)
+        ).fetchall()
+
+    return {
+        "ok": True,
+        "team_version": TEAM_WITNESS_VERSION,
+        "items": [row_to_dict(row) for row in rows]
+    }
+
+
+@app.get("/witness/outbox")
+def witness_outbox(telegram_id: str, limit: int = 20):
+    telegram_id = telegram_id.strip()
+    if not telegram_id:
+        raise HTTPException(status_code=400, detail="شناسه تلگرام الزامی است")
+
+    limit = max(1, min(int(limit or 20), 100))
+
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT wr.*, p.proof_text, t.title AS contract_title
+            FROM witness_requests wr
+            JOIN proofs p ON p.id = wr.proof_id
+            JOIN tasks t ON t.id = wr.task_id
+            WHERE wr.telegram_id = ?
+            ORDER BY wr.id DESC
+            LIMIT ?
+            """,
+            (telegram_id, limit)
+        ).fetchall()
+
+    return {
+        "ok": True,
+        "team_version": TEAM_WITNESS_VERSION,
+        "items": [row_to_dict(row) for row in rows]
+    }
+
+
+@app.post("/witness/respond")
+def witness_respond(data: WitnessRespondRequest):
+    witness_telegram_id = data.witness_telegram_id.strip()
+    decision = data.decision.strip().lower()
+    note = (data.note or "").strip()
+
+    if not witness_telegram_id:
+        raise HTTPException(status_code=400, detail="شناسه شاهد الزامی است")
+    if decision not in {"approved", "rejected"}:
+        raise HTTPException(status_code=400, detail="تصمیم شاهد نامعتبر است")
+
+    with get_db() as conn:
+        witness_request = conn.execute(
+            """
+            SELECT * FROM witness_requests
+            WHERE id = ? AND witness_telegram_id = ?
+            LIMIT 1
+            """,
+            (data.witness_id, witness_telegram_id)
+        ).fetchone()
+
+        if witness_request is None:
+            raise HTTPException(status_code=404, detail="درخواست شاهد پیدا نشد")
+
+        if witness_request["status"] != "pending":
+            return {
+                "ok": False,
+                "code": "witness_request_already_closed",
+                "message": "این درخواست قبلاً پاسخ داده شده است.",
+                "witness_request": row_to_dict(witness_request)
+            }
+
+        responded = now_iso()
+        conn.execute(
+            """
+            UPDATE witness_requests
+            SET status = ?, decision = ?, witness_note = ?, responded_at = ?
+            WHERE id = ?
+            """,
+            (decision, decision, note, responded, data.witness_id)
+        )
+
+        if decision == "approved":
+            conn.execute(
+                """
+                UPDATE proofs
+                SET witness_status = 'confirmed',
+                    witness_confirmed_count = witness_confirmed_count + 1
+                WHERE id = ?
+                """,
+                (witness_request["proof_id"],)
+            )
+
+        conn.execute(
+            """
+            INSERT INTO progression_events (
+                telegram_id, event_type, xp_delta, old_stage, new_stage, metadata, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                witness_request["telegram_id"],
+                "witness_approved" if decision == "approved" else "witness_rejected",
+                0,
+                None,
+                None,
+                f"witness_request_id={data.witness_id};proof_id={witness_request['proof_id']};witness_id={witness_telegram_id}",
+                responded,
+            )
+        )
+
+        conn.commit()
+        updated = conn.execute(
+            "SELECT * FROM witness_requests WHERE id = ?",
+            (data.witness_id,)
+        ).fetchone()
+
+    if decision == "approved":
+        send_bot_message(
+            witness_request["telegram_id"],
+            (
+                "✅ شاهد، اثبات تو را تایید کرد.\n\n"
+                f"شناسه اثبات: {witness_request['proof_id']}\n"
+                f"یادداشت شاهد: {note or '—'}"
+            )
+        )
+    else:
+        send_bot_message(
+            witness_request["telegram_id"],
+            (
+                "⚠️ شاهد، اثبات تو را تایید نکرد.\n\n"
+                f"شناسه اثبات: {witness_request['proof_id']}\n"
+                f"یادداشت شاهد: {note or '—'}"
+            )
+        )
+
+    return {
+        "ok": True,
+        "decision": decision,
+        "witness_request": row_to_dict(updated),
+        "team_version": TEAM_WITNESS_VERSION
+    }
+
+
 @app.get("/review/queue")
 def review_queue(limit: int = 20):
     limit = max(1, min(int(limit or 20), 100))
@@ -2694,6 +3361,9 @@ def debug_state():
         proofs = [row_to_dict(r) for r in conn.execute("SELECT * FROM proofs ORDER BY id DESC").fetchall()]
         events = [row_to_dict(r) for r in conn.execute("SELECT * FROM progression_events ORDER BY id DESC").fetchall()]
         appeals = [row_to_dict(r) for r in conn.execute("SELECT * FROM proof_appeals ORDER BY id DESC").fetchall()]
+        teams = [row_to_dict(r) for r in conn.execute("SELECT * FROM teams ORDER BY id DESC").fetchall()]
+        team_members = [row_to_dict(r) for r in conn.execute("SELECT * FROM team_members ORDER BY id DESC").fetchall()]
+        witness_requests = [row_to_dict(r) for r in conn.execute("SELECT * FROM witness_requests ORDER BY id DESC").fetchall()]
 
     return {
         "ok": True,
@@ -2701,5 +3371,8 @@ def debug_state():
         "tasks": tasks,
         "proofs": proofs,
         "appeals": appeals,
+        "teams": teams,
+        "team_members": team_members,
+        "witness_requests": witness_requests,
         "events": events
     }
