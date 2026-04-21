@@ -6,12 +6,21 @@ import sqlite3
 import urllib.parse
 import urllib.request
 
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except Exception:  # psycopg is only required when DATABASE_URL is configured
+    psycopg = None
+    dict_row = None
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 
 DB_PATH = "royal_guardian.db"
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+DB_BACKEND = "postgres" if DATABASE_URL else "sqlite"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 V36C_VALIDATION_VERSION = "v36c-contract-validation-lite-1"
 PROOF_CORE_VERSION = "v36c-proof-core-lite-1"
@@ -47,7 +56,7 @@ AMBIGUOUS_PREFIXES = (
 
 app = FastAPI(
     title="Royal Guardian Backend",
-    version="0.10.1-dashboard-timeline-v1"
+    version="0.11.0-postgres-persistence-v1"
 )
 
 app.add_middleware(
@@ -67,11 +76,83 @@ def today_iso_date() -> str:
     return datetime.utcnow().date().isoformat()
 
 
+def _convert_sql_for_postgres(sql: str) -> str:
+    # This codebase uses SQLite-style ? placeholders. psycopg uses %s.
+    return sql.replace("?", "%s")
+
+
+def _insert_table_name(sql: str) -> Optional[str]:
+    match = re.search(r"^\s*INSERT\s+INTO\s+([a-zA-Z_][a-zA-Z0-9_]*)", sql, flags=re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1).lower()
+
+
+class CursorResult:
+    def __init__(self, cursor, lastrowid=None):
+        self._cursor = cursor
+        self.lastrowid = lastrowid
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+
+class PostgresConnection:
+    def __init__(self):
+        if psycopg is None:
+            raise RuntimeError("DATABASE_URL is configured, but psycopg is not installed. Add psycopg[binary] to requirements.txt")
+        self._conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+
+    def execute(self, sql: str, params=()):
+        pg_sql = _convert_sql_for_postgres(sql)
+        cur = self._conn.cursor()
+        cur.execute(pg_sql, params or ())
+
+        lastrowid = None
+        table = _insert_table_name(sql)
+        if table in {"tasks", "proofs", "progression_events", "proof_appeals"}:
+            # PostgreSQL sequence value for the last INSERT in this connection.
+            # Used to preserve sqlite-style cursor.lastrowid behavior.
+            seq_cur = self._conn.cursor()
+            seq_cur.execute("SELECT LASTVAL() AS id")
+            row = seq_cur.fetchone()
+            if row:
+                lastrowid = row["id"]
+
+        return CursorResult(cur, lastrowid=lastrowid)
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        self._conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type is None:
+                self._conn.commit()
+            else:
+                self._conn.rollback()
+        finally:
+            self._conn.close()
+
+
 def get_db():
+    if DB_BACKEND == "postgres":
+        return PostgresConnection()
+
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
-
 
 def row_to_dict(row) -> Optional[Dict[str, Any]]:
     if row is None:
@@ -670,11 +751,28 @@ def apply_review_award(
         "user": row_to_dict(updated_user),
     }
 
-def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+def ensure_column(conn, table: str, column: str, definition: str) -> None:
     """
-    مهاجرت ساده SQLite: اگر ستون وجود نداشت، اضافه می‌شود.
-    این روش برای MVP امن است و داده‌های قبلی را پاک نمی‌کند.
+    Safe MVP migration: add missing columns without deleting existing data.
+    Works for both SQLite and PostgreSQL.
     """
+    if DB_BACKEND == "postgres":
+        row = conn.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = ?
+              AND column_name = ?
+            LIMIT 1
+            """,
+            (table, column)
+        ).fetchone()
+
+        if row is None:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        return
+
     existing_columns = {
         row["name"]
         for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
@@ -684,62 +782,155 @@ def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
+def create_base_tables_postgres(conn) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            telegram_id TEXT PRIMARY KEY,
+            first_name TEXT NOT NULL,
+            username TEXT,
+            xp INTEGER NOT NULL DEFAULT 240,
+            streak_days INTEGER NOT NULL DEFAULT 5,
+            guardian_stage TEXT NOT NULL DEFAULT 'شکاف طلایی',
+            verified_proofs_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id SERIAL PRIMARY KEY,
+            telegram_id TEXT NOT NULL REFERENCES users (telegram_id),
+            title TEXT NOT NULL,
+            deadline TEXT NOT NULL,
+            proof_type TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS proofs (
+            id SERIAL PRIMARY KEY,
+            telegram_id TEXT NOT NULL REFERENCES users (telegram_id),
+            task_id INTEGER NOT NULL REFERENCES tasks (id),
+            proof_text TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'submitted',
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS progression_events (
+            id SERIAL PRIMARY KEY,
+            telegram_id TEXT NOT NULL REFERENCES users (telegram_id),
+            event_type TEXT NOT NULL,
+            xp_delta INTEGER NOT NULL DEFAULT 0,
+            old_stage TEXT,
+            new_stage TEXT,
+            metadata TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS proof_appeals (
+            id SERIAL PRIMARY KEY,
+            telegram_id TEXT NOT NULL REFERENCES users (telegram_id),
+            proof_id INTEGER NOT NULL REFERENCES proofs (id),
+            task_id INTEGER NOT NULL REFERENCES tasks (id),
+            appeal_text TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            reviewer_id TEXT,
+            resolution_note TEXT,
+            created_at TEXT NOT NULL,
+            resolved_at TEXT
+        )
+    """)
+
+
+def create_base_tables_sqlite(conn) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            telegram_id TEXT PRIMARY KEY,
+            first_name TEXT NOT NULL,
+            username TEXT,
+            xp INTEGER NOT NULL DEFAULT 240,
+            streak_days INTEGER NOT NULL DEFAULT 5,
+            guardian_stage TEXT NOT NULL DEFAULT 'شکاف طلایی',
+            verified_proofs_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            deadline TEXT NOT NULL,
+            proof_type TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (telegram_id) REFERENCES users (telegram_id)
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS proofs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id TEXT NOT NULL,
+            task_id INTEGER NOT NULL,
+            proof_text TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'submitted',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (telegram_id) REFERENCES users (telegram_id),
+            FOREIGN KEY (task_id) REFERENCES tasks (id)
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS progression_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            xp_delta INTEGER NOT NULL DEFAULT 0,
+            old_stage TEXT,
+            new_stage TEXT,
+            metadata TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (telegram_id) REFERENCES users (telegram_id)
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS proof_appeals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id TEXT NOT NULL,
+            proof_id INTEGER NOT NULL,
+            task_id INTEGER NOT NULL,
+            appeal_text TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            reviewer_id TEXT,
+            resolution_note TEXT,
+            created_at TEXT NOT NULL,
+            resolved_at TEXT,
+            FOREIGN KEY (telegram_id) REFERENCES users (telegram_id),
+            FOREIGN KEY (proof_id) REFERENCES proofs (id),
+            FOREIGN KEY (task_id) REFERENCES tasks (id)
+        )
+    """)
+
+
 def init_db():
     with get_db() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                telegram_id TEXT PRIMARY KEY,
-                first_name TEXT NOT NULL,
-                username TEXT,
-                xp INTEGER NOT NULL DEFAULT 240,
-                streak_days INTEGER NOT NULL DEFAULT 5,
-                guardian_stage TEXT NOT NULL DEFAULT 'شکاف طلایی',
-                verified_proofs_count INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-        """)
-
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_id TEXT NOT NULL,
-                title TEXT NOT NULL,
-                deadline TEXT NOT NULL,
-                proof_type TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'active',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                FOREIGN KEY (telegram_id) REFERENCES users (telegram_id)
-            )
-        """)
-
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS proofs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_id TEXT NOT NULL,
-                task_id INTEGER NOT NULL,
-                proof_text TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'submitted',
-                created_at TEXT NOT NULL,
-                FOREIGN KEY (telegram_id) REFERENCES users (telegram_id),
-                FOREIGN KEY (task_id) REFERENCES tasks (id)
-            )
-        """)
-
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS progression_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_id TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                xp_delta INTEGER NOT NULL DEFAULT 0,
-                old_stage TEXT,
-                new_stage TEXT,
-                metadata TEXT,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY (telegram_id) REFERENCES users (telegram_id)
-            )
-        """)
+        if DB_BACKEND == "postgres":
+            create_base_tables_postgres(conn)
+        else:
+            create_base_tables_sqlite(conn)
 
         # Contract Core V1 fields on top of the old tasks table.
         # We keep the table name "tasks" for compatibility with the current Mini App.
@@ -787,24 +978,6 @@ def init_db():
         ensure_column(conn, "proofs", "review_decision", "TEXT")
         ensure_column(conn, "proofs", "review_version", "TEXT")
         ensure_column(conn, "proofs", "awarded_after_review", "INTEGER NOT NULL DEFAULT 0")
-
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS proof_appeals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_id TEXT NOT NULL,
-                proof_id INTEGER NOT NULL,
-                task_id INTEGER NOT NULL,
-                appeal_text TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'open',
-                reviewer_id TEXT,
-                resolution_note TEXT,
-                created_at TEXT NOT NULL,
-                resolved_at TEXT,
-                FOREIGN KEY (telegram_id) REFERENCES users (telegram_id),
-                FOREIGN KEY (proof_id) REFERENCES proofs (id),
-                FOREIGN KEY (task_id) REFERENCES tasks (id)
-            )
-        """)
 
         conn.commit()
 
@@ -870,7 +1043,9 @@ def root():
         "status": "ok",
         "message": "Royal Guardian backend is running",
         "database": DB_PATH,
-        "version": "0.10.1-dashboard-timeline-v1"
+        "db_backend": DB_BACKEND,
+        "database_url_configured": bool(DATABASE_URL),
+        "version": "0.11.0-postgres-persistence-v1"
     }
 
 
@@ -880,10 +1055,35 @@ def health():
         "ok": True,
         "time": now_iso(),
         "database": DB_PATH,
+        "db_backend": DB_BACKEND,
+        "database_url_configured": bool(DATABASE_URL),
         "bot_token_configured": bool(BOT_TOKEN),
-        "version": "0.10.1-dashboard-timeline-v1"
+        "version": "0.11.0-postgres-persistence-v1"
     }
 
+
+
+@app.get("/db/status")
+def db_status():
+    with get_db() as conn:
+        users_count = conn.execute("SELECT COUNT(*) AS count FROM users").fetchone()["count"]
+        tasks_count = conn.execute("SELECT COUNT(*) AS count FROM tasks").fetchone()["count"]
+        proofs_count = conn.execute("SELECT COUNT(*) AS count FROM proofs").fetchone()["count"]
+        appeals_count = conn.execute("SELECT COUNT(*) AS count FROM proof_appeals").fetchone()["count"]
+        events_count = conn.execute("SELECT COUNT(*) AS count FROM progression_events").fetchone()["count"]
+
+    return {
+        "ok": True,
+        "db_backend": DB_BACKEND,
+        "database_url_configured": bool(DATABASE_URL),
+        "counts": {
+            "users": users_count,
+            "tasks": tasks_count,
+            "proofs": proofs_count,
+            "appeals": appeals_count,
+            "events": events_count,
+        }
+    }
 
 @app.get("/bot/status")
 def bot_status():
