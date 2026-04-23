@@ -1,6 +1,7 @@
 from datetime import datetime
 from typing import Optional, Dict, Any
 import os
+import json
 import re
 import secrets
 import sqlite3
@@ -30,6 +31,7 @@ DAILY_LIFECYCLE_VERSION = "v36c-daily-lifecycle-lite-1"
 REVIEW_APPEAL_VERSION = "v36c-review-appeal-lite-1"
 DASHBOARD_TIMELINE_VERSION = "v36c-dashboard-timeline-lite-1"
 TEAM_WITNESS_VERSION = "v36c-team-witness-lite-1"
+BOT_COMMAND_VERSION = "v36c-bot-command-center-lite-1"
 
 VALID_PROOF_TYPE_MAP = {
     "text": "text",
@@ -58,7 +60,7 @@ AMBIGUOUS_PREFIXES = (
 
 app = FastAPI(
     title="Royal Guardian Backend",
-    version="0.12.0-team-witness-v1"
+    version="0.13.0-bot-command-center-v1"
 )
 
 app.add_middleware(
@@ -1159,7 +1161,7 @@ def root():
         "database": DB_PATH,
         "db_backend": DB_BACKEND,
         "database_url_configured": bool(DATABASE_URL),
-        "version": "0.12.0-team-witness-v1"
+        "version": "0.13.0-bot-command-center-v1"
     }
 
 
@@ -1172,7 +1174,7 @@ def health():
         "db_backend": DB_BACKEND,
         "database_url_configured": bool(DATABASE_URL),
         "bot_token_configured": bool(BOT_TOKEN),
-        "version": "0.12.0-team-witness-v1"
+        "version": "0.13.0-bot-command-center-v1"
     }
 
 
@@ -1224,6 +1226,503 @@ def bot_test_message(telegram_id: str):
         "telegram_id": telegram_id,
         "sent": sent
     }
+
+
+def telegram_api_call(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not BOT_TOKEN:
+        return {
+            "ok": False,
+            "description": "BOT_TOKEN is not configured"
+        }
+
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            raw = response.read().decode("utf-8")
+            try:
+                return json.loads(raw)
+            except Exception:
+                return {
+                    "ok": 200 <= response.status < 300,
+                    "raw": raw
+                }
+    except Exception as exc:
+        print(f"[telegram_api_failed] method={method} error={exc}")
+        return {
+            "ok": False,
+            "description": str(exc)
+        }
+
+
+def send_bot_command_message(chat_id: str, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> bool:
+    payload = {
+        "chat_id": str(chat_id),
+        "text": text,
+        "disable_web_page_preview": True
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+
+    result = telegram_api_call("sendMessage", payload)
+    ok = bool(result.get("ok"))
+    print(f"[bot_command_message] chat_id={chat_id} ok={ok}")
+    return ok
+
+
+def answer_callback_query(callback_query_id: str, text: str = "") -> bool:
+    if not callback_query_id:
+        return False
+    result = telegram_api_call("answerCallbackQuery", {
+        "callback_query_id": callback_query_id,
+        "text": text[:180] if text else ""
+    })
+    return bool(result.get("ok"))
+
+
+def bot_main_keyboard() -> Dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "وضعیت من", "callback_data": "cmd:status"},
+                {"text": "قرارداد امروز", "callback_data": "cmd:today"}
+            ],
+            [
+                {"text": "داشبورد", "callback_data": "cmd:dashboard"},
+                {"text": "تیم من", "callback_data": "cmd:team"}
+            ],
+            [
+                {"text": "شاهد", "callback_data": "cmd:witness"},
+                {"text": "تاریخچه", "callback_data": "cmd:history"}
+            ],
+            [
+                {"text": "راهنما", "callback_data": "cmd:help"}
+            ]
+        ]
+    }
+
+
+def bot_features_text() -> str:
+    return (
+        "🧭 مرکز فرماندهی فعال است.\n\n"
+        "قابلیت‌هایی که الان از بک‌اند قابل استفاده‌اند:\n"
+        "• قرارداد اجرایی روزانه\n"
+        "• اعتبارسنجی قرارداد\n"
+        "• ثبت اثبات و امتیازدهی\n"
+        "• جلوگیری از ثبت تکراری\n"
+        "• چرخه روزانه قرارداد\n"
+        "• Review و Appeal\n"
+        "• داشبورد و خط زمان\n"
+        "• تیم اجرایی\n"
+        "• شاهد برای اثبات\n"
+        "• ذخیره دائمی در Postgres\n\n"
+        "دستورها:\n"
+        "/start — مرکز فرماندهی\n"
+        "/status — وضعیت من\n"
+        "/today — قرارداد امروز\n"
+        "/dashboard — داشبورد\n"
+        "/team — تیم من\n"
+        "/witness — شاهدها\n"
+        "/history — تاریخچه\n"
+        "/help — راهنما"
+    )
+
+
+def create_or_touch_bot_user(telegram_id: str, first_name: str = "کاربر", username: Optional[str] = None) -> None:
+    with get_db() as conn:
+        ensure_user_exists(conn, telegram_id, first_name=first_name or "کاربر", username=username)
+        conn.commit()
+
+
+def fa_number(value) -> str:
+    return str(value)
+
+
+def bot_status_text(telegram_id: str) -> str:
+    data = get_user_dashboard_data(telegram_id)
+    user = data.get("user") or {}
+    stats = data.get("stats") or {}
+    lifecycle = data.get("lifecycle") or {}
+    next_action = data.get("next_action") or {}
+
+    return (
+        "🛡 وضعیت اجرای تو\n\n"
+        f"امتیاز اجرایی: {fa_number(user.get('xp', 0))}\n"
+        f"زنجیره اجرا: {fa_number(user.get('streak_days', 0))} روز\n"
+        f"مرحله نگهبان: {user.get('guardian_stage', 'هسته خاموش')}\n\n"
+        f"قراردادها: {fa_number(sum((stats.get('contracts') or {}).values()))}\n"
+        f"اثبات‌ها: {fa_number(stats.get('total_proofs', 0))}\n"
+        f"میانگین کیفیت اثبات: {fa_number(stats.get('avg_proof_quality', 0))}\n\n"
+        f"وضعیت امروز: {lifecycle.get('message', 'نامشخص')}\n"
+        f"اقدام بعدی: {next_action.get('title', 'قرارداد اجرایی بساز')}"
+    )
+
+
+def bot_today_text(telegram_id: str) -> str:
+    with get_db() as conn:
+        task = conn.execute(
+            """
+            SELECT * FROM tasks
+            WHERE telegram_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (telegram_id,)
+        ).fetchone()
+        lifecycle = build_task_lifecycle(conn, task)
+
+    if task is None:
+        return (
+            "📌 هنوز قراردادی ثبت نشده است.\n\n"
+            "برای شروع، از Mini App قرارداد تازه بساز. بعد از آن من همین‌جا وضعیت را نشان می‌دهم."
+        )
+
+    return (
+        "📌 قرارداد فعلی\n\n"
+        f"عنوان: {task['title']}\n"
+        f"وضعیت: {task['status']}\n"
+        f"مهلت: {task['deadline']}\n"
+        f"نوع اثبات: {task['proof_type']}\n"
+        f"کیفیت قرارداد: {task['contract_quality_score']} از ۱۰۰\n"
+        f"ریسک اجرا: {task['predicted_risk']}\n\n"
+        f"تعریف انجام‌شدن:\n{task['done_definition']}\n\n"
+        f"وضعیت چرخه:\n{lifecycle.get('message')}"
+    )
+
+
+def bot_dashboard_text(telegram_id: str) -> str:
+    data = get_user_dashboard_data(telegram_id)
+    stats = data.get("stats") or {}
+    next_action = data.get("next_action") or {}
+    latest_contract = data.get("latest_contract") or {}
+    latest_proof = data.get("latest_proof") or {}
+
+    return (
+        "📊 داشبورد اجرا\n\n"
+        f"اقدام بعدی: {next_action.get('title', 'نامشخص')}\n"
+        f"{next_action.get('description', '')}\n\n"
+        f"آخرین قرارداد: {latest_contract.get('title', 'ثبت نشده')}\n"
+        f"آخرین اثبات: {latest_proof.get('review_status', 'ثبت نشده')}\n\n"
+        f"تعداد قراردادها: {fa_number(sum((stats.get('contracts') or {}).values()))}\n"
+        f"تعداد اثبات‌ها: {fa_number(stats.get('total_proofs', 0))}\n"
+        f"تعداد اعتراض‌ها: {fa_number(sum((stats.get('appeals') or {}).values()))}"
+    )
+
+
+def bot_team_text(telegram_id: str) -> str:
+    with get_db() as conn:
+        team = conn.execute(
+            """
+            SELECT t.*
+            FROM teams t
+            JOIN team_members tm ON tm.team_id = t.id
+            WHERE tm.telegram_id = ? AND tm.status = 'active'
+            ORDER BY t.id DESC
+            LIMIT 1
+            """,
+            (telegram_id,)
+        ).fetchone()
+
+        if team is None:
+            return (
+                "👥 هنوز تیم فعالی نداری.\n\n"
+                "از Mini App یا endpoint /teams می‌توانی تیم بسازی. بعد کد دعوت تیم اینجا نمایش داده می‌شود."
+            )
+
+        members = conn.execute(
+            """
+            SELECT tm.*, u.first_name, u.username, u.xp, u.streak_days, u.guardian_stage
+            FROM team_members tm
+            LEFT JOIN users u ON u.telegram_id = tm.telegram_id
+            WHERE tm.team_id = ? AND tm.status = 'active'
+            ORDER BY tm.id ASC
+            """,
+            (team["id"],)
+        ).fetchall()
+
+    member_lines = []
+    for row in members[:6]:
+        member_lines.append(
+            f"• {row['first_name'] or row['telegram_id']} — {row['xp'] or 0} امتیاز، زنجیره {row['streak_days'] or 0}"
+        )
+
+    return (
+        "👥 تیم اجرایی تو\n\n"
+        f"نام تیم: {team['name']}\n"
+        f"کد دعوت: {team['invite_code']}\n"
+        f"تعداد اعضا: {len(members)}\n\n"
+        "اعضا:\n"
+        + ("\n".join(member_lines) if member_lines else "عضوی ثبت نشده است.")
+    )
+
+
+def bot_witness_text(telegram_id: str) -> str:
+    with get_db() as conn:
+        inbox = conn.execute(
+            """
+            SELECT *
+            FROM witness_requests
+            WHERE witness_telegram_id = ? AND status = 'pending'
+            ORDER BY id DESC
+            LIMIT 5
+            """,
+            (telegram_id,)
+        ).fetchall()
+
+        outbox = conn.execute(
+            """
+            SELECT *
+            FROM witness_requests
+            WHERE telegram_id = ?
+            ORDER BY id DESC
+            LIMIT 5
+            """,
+            (telegram_id,)
+        ).fetchall()
+
+    if not inbox and not outbox:
+        return (
+            "👁 شاهد\n\n"
+            "درخواست شاهد فعالی وجود ندارد. بعد از ثبت اثبات، می‌توانی برای آن شاهد بگیری."
+        )
+
+    inbox_lines = [
+        f"• درخواست #{row['id']} برای اثبات #{row['proof_id']} — {row['status']}"
+        for row in inbox
+    ]
+    outbox_lines = [
+        f"• اثبات #{row['proof_id']} برای شاهد {row['witness_telegram_id']} — {row['status']}"
+        for row in outbox
+    ]
+
+    return (
+        "👁 وضعیت شاهدها\n\n"
+        "درخواست‌های دریافتی:\n"
+        + ("\n".join(inbox_lines) if inbox_lines else "موردی نیست")
+        + "\n\nدرخواست‌های ارسال‌شده:\n"
+        + ("\n".join(outbox_lines) if outbox_lines else "موردی نیست")
+    )
+
+
+def bot_history_text(telegram_id: str) -> str:
+    with get_db() as conn:
+        events = conn.execute(
+            """
+            SELECT * FROM progression_events
+            WHERE telegram_id = ?
+            ORDER BY id DESC
+            LIMIT 8
+            """,
+            (telegram_id,)
+        ).fetchall()
+
+    if not events:
+        return "📜 هنوز رویدادی ثبت نشده است."
+
+    lines = []
+    for event in events:
+        label = event_label_fa(event["event_type"])
+        lines.append(f"• {label} — {event['created_at'][:16].replace('T', ' ')}")
+
+    return "📜 تاریخچه کوتاه\n\n" + "\n".join(lines)
+
+
+def handle_bot_command(chat_id: str, command: str, first_name: str = "کاربر", username: Optional[str] = None) -> bool:
+    telegram_id = str(chat_id)
+    create_or_touch_bot_user(telegram_id, first_name=first_name, username=username)
+
+    command = (command or "/start").strip().lower()
+    if command.startswith("cmd:"):
+        command = "/" + command.split(":", 1)[1]
+
+    if command.startswith("/start"):
+        return send_bot_command_message(
+            telegram_id,
+            (
+                "🦁 نگهبان سلطنتی فعال است.\n\n"
+                "از اینجا می‌توانی قابلیت‌های اصلی را بدون ورود به Mini App ببینی. "
+                "Mini App برای فرم‌های دقیق و تجربه تصویری است؛ بات برای کنترل سریع."
+            ),
+            bot_main_keyboard()
+        )
+
+    if command.startswith("/help"):
+        return send_bot_command_message(telegram_id, bot_features_text(), bot_main_keyboard())
+
+    if command.startswith("/status"):
+        return send_bot_command_message(telegram_id, bot_status_text(telegram_id), bot_main_keyboard())
+
+    if command.startswith("/today"):
+        return send_bot_command_message(telegram_id, bot_today_text(telegram_id), bot_main_keyboard())
+
+    if command.startswith("/dashboard"):
+        return send_bot_command_message(telegram_id, bot_dashboard_text(telegram_id), bot_main_keyboard())
+
+    if command.startswith("/team"):
+        return send_bot_command_message(telegram_id, bot_team_text(telegram_id), bot_main_keyboard())
+
+    if command.startswith("/witness"):
+        return send_bot_command_message(telegram_id, bot_witness_text(telegram_id), bot_main_keyboard())
+
+    if command.startswith("/history"):
+        return send_bot_command_message(telegram_id, bot_history_text(telegram_id), bot_main_keyboard())
+
+    return send_bot_command_message(
+        telegram_id,
+        "دستور را متوجه نشدم. از دکمه‌های زیر استفاده کن.",
+        bot_main_keyboard()
+    )
+
+
+@app.get("/features")
+def features():
+    return {
+        "ok": True,
+        "version": "0.13.0-bot-command-center-v1",
+        "bot_command_version": BOT_COMMAND_VERSION,
+        "features": [
+            "contract_core",
+            "contract_validation",
+            "proof_core",
+            "execution_integrity",
+            "daily_lifecycle",
+            "review_queue",
+            "appeal_flow",
+            "dashboard_timeline",
+            "postgres_persistence",
+            "team_core",
+            "witness_flow",
+            "bot_command_center"
+        ]
+    }
+
+
+@app.get("/bot/commands-preview")
+def bot_commands_preview():
+    return {
+        "ok": True,
+        "bot_command_version": BOT_COMMAND_VERSION,
+        "commands": [
+            "/start",
+            "/status",
+            "/today",
+            "/dashboard",
+            "/team",
+            "/witness",
+            "/history",
+            "/help"
+        ],
+        "keyboard": bot_main_keyboard()
+    }
+
+
+@app.get("/bot/set-webhook")
+def bot_set_webhook(url: Optional[str] = None):
+    if not BOT_TOKEN:
+        raise HTTPException(status_code=503, detail="BOT_TOKEN تنظیم نشده است")
+
+    webhook_url = (url or "https://royal-guardian-backend.onrender.com/bot/webhook").strip()
+    result = telegram_api_call("setWebhook", {
+        "url": webhook_url,
+        "allowed_updates": ["message", "callback_query"]
+    })
+    return {
+        "ok": bool(result.get("ok")),
+        "webhook_url": webhook_url,
+        "telegram_result": result
+    }
+
+
+@app.get("/bot/webhook-info")
+def bot_webhook_info():
+    result = telegram_api_call("getWebhookInfo", {})
+    return {
+        "ok": bool(result.get("ok")),
+        "telegram_result": result
+    }
+
+
+@app.get("/bot/delete-webhook")
+def bot_delete_webhook():
+    result = telegram_api_call("deleteWebhook", {})
+    return {
+        "ok": bool(result.get("ok")),
+        "telegram_result": result
+    }
+
+
+@app.post("/bot/webhook")
+def bot_webhook(update: Dict[str, Any]):
+    try:
+        if "callback_query" in update:
+            callback = update["callback_query"]
+            data = callback.get("data") or "cmd:start"
+            message = callback.get("message") or {}
+            chat = message.get("chat") or {}
+            user = callback.get("from") or {}
+            chat_id = str(chat.get("id") or user.get("id") or "")
+            first_name = user.get("first_name") or "کاربر"
+            username = user.get("username")
+
+            if callback.get("id"):
+                answer_callback_query(callback["id"], "در حال دریافت...")
+
+            if chat_id:
+                handle_bot_command(chat_id, data, first_name=first_name, username=username)
+
+            return {
+                "ok": True,
+                "type": "callback_query",
+                "handled": bool(chat_id)
+            }
+
+        message = update.get("message") or update.get("edited_message") or {}
+        chat = message.get("chat") or {}
+        user = message.get("from") or {}
+        chat_id = str(chat.get("id") or user.get("id") or "")
+        text = (message.get("text") or "").strip()
+        first_name = user.get("first_name") or chat.get("first_name") or "کاربر"
+        username = user.get("username") or chat.get("username")
+
+        if not chat_id:
+            return {
+                "ok": True,
+                "handled": False,
+                "reason": "no chat id"
+            }
+
+        if not text:
+            send_bot_command_message(
+                chat_id,
+                "پیام دریافت شد. برای کنترل سریع از دکمه‌ها استفاده کن.",
+                bot_main_keyboard()
+            )
+            return {
+                "ok": True,
+                "handled": True,
+                "type": "non_text"
+            }
+
+        handle_bot_command(chat_id, text, first_name=first_name, username=username)
+
+        return {
+            "ok": True,
+            "handled": True,
+            "text": text
+        }
+
+    except Exception as exc:
+        print(f"[bot_webhook_error] {exc}")
+        return {
+            "ok": False,
+            "error": str(exc)
+        }
 
 
 def ensure_user_exists(conn: sqlite3.Connection, telegram_id: str, first_name: str = "کاربر", username: Optional[str] = None):
