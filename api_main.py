@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 import os
 import json
@@ -15,7 +15,7 @@ except Exception:  # psycopg is only required when DATABASE_URL is configured
     psycopg = None
     dict_row = None
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -32,6 +32,20 @@ REVIEW_APPEAL_VERSION = "v36c-review-appeal-lite-1"
 DASHBOARD_TIMELINE_VERSION = "v36c-dashboard-timeline-lite-1"
 TEAM_WITNESS_VERSION = "v36c-team-witness-lite-1"
 BOT_COMMAND_VERSION = "v36c-bot-command-center-lite-1"
+B1_EXECUTION_LOOP_VERSION = "b1m-webhook-lock-security-fixes-v1"
+BOT_TICK_TOKEN = os.getenv("BOT_TICK_TOKEN", "").strip()
+BOT_CRON_TOKEN = os.getenv("BOT_CRON_TOKEN", "").strip()
+BOT_CRON_LOCK_SECONDS = int(os.getenv("BOT_CRON_LOCK_SECONDS", "120") or "120")
+BOT_TICK_ALLOW_DEV_NO_TOKEN = os.getenv("BOT_TICK_ALLOW_DEV_NO_TOKEN", "").strip().lower() in {"1", "true", "yes", "on"}
+AUTO_SEED_DEFAULT_TASK = os.getenv("AUTO_SEED_DEFAULT_TASK", "").strip().lower() in {"1", "true", "yes", "on"}
+# Telegram sends this header only if setWebhook(secret_token=...) was configured.
+TELEGRAM_WEBHOOK_SECRET_TOKEN = (
+    os.getenv("TELEGRAM_WEBHOOK_SECRET_TOKEN", "").strip()
+    or os.getenv("BOT_WEBHOOK_SECRET", "").strip()
+)
+DEFAULT_CORS_ORIGINS = "http://localhost:3000,http://127.0.0.1:3000,https://resilient-dango-f36f76.netlify.app"
+CORS_ALLOW_ORIGINS = [x.strip() for x in os.getenv("CORS_ALLOW_ORIGINS", DEFAULT_CORS_ORIGINS).split(",") if x.strip()]
+CORS_ALLOW_ORIGIN_REGEX = os.getenv("CORS_ALLOW_ORIGIN_REGEX", r"https://.*\.netlify\.app").strip() or None
 
 VALID_PROOF_TYPE_MAP = {
     "text": "text",
@@ -60,12 +74,13 @@ AMBIGUOUS_PREFIXES = (
 
 app = FastAPI(
     title="Royal Guardian Backend",
-    version="0.13.0-bot-command-center-v1"
+    version="0.14.9-b1m-webhook-lock-security-fixes-v1"
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # برای تست. بعداً فقط دامنه Netlify را مجاز می‌کنیم.
+    allow_origins=CORS_ALLOW_ORIGINS,
+    allow_origin_regex=CORS_ALLOW_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -112,17 +127,20 @@ class PostgresConnection:
 
     def execute(self, sql: str, params=()):
         pg_sql = _convert_sql_for_postgres(sql)
+        table = _insert_table_name(sql)
+        needs_returning = (
+            table in {"tasks", "proofs", "progression_events", "proof_appeals", "teams", "team_members", "witness_requests", "bot_interactions", "bot_notifications_log"}
+            and "RETURNING" not in sql.upper()
+        )
+        if needs_returning:
+            pg_sql = pg_sql.rstrip().rstrip(";") + " RETURNING id"
+
         cur = self._conn.cursor()
         cur.execute(pg_sql, params or ())
 
         lastrowid = None
-        table = _insert_table_name(sql)
-        if table in {"tasks", "proofs", "progression_events", "proof_appeals", "teams", "team_members", "witness_requests"}:
-            # PostgreSQL sequence value for the last INSERT in this connection.
-            # Used to preserve sqlite-style cursor.lastrowid behavior.
-            seq_cur = self._conn.cursor()
-            seq_cur.execute("SELECT LASTVAL() AS id")
-            row = seq_cur.fetchone()
+        if needs_returning:
+            row = cur.fetchone()
             if row:
                 lastrowid = row["id"]
 
@@ -513,6 +531,709 @@ def review_status_label_fa(status: str) -> str:
     }.get(str(status), "نامشخص")
 
 
+def _utc_now() -> datetime:
+    return datetime.utcnow()
+
+
+def _iso(dt: datetime) -> str:
+    return dt.replace(microsecond=0).isoformat()
+
+
+def parse_minutes_token(text: str, default: int = 10) -> int:
+    raw = str(text or "").strip().lower().replace(" ", "")
+    digits = re.findall(r"\d+", raw)
+    if not digits:
+        return default
+    value = int(digits[0])
+    if "h" in raw or "hour" in raw or "ساعت" in raw:
+        value *= 60
+    return max(1, min(value, 24 * 60))
+
+
+def parse_deadline_at(deadline: str, estimated_minutes: int = 30) -> datetime:
+    """Best-effort UTC deadline parser for MVP tests.
+    Supports: +3min, +10m, HH:MM, ISO datetime. If HH:MM already passed, uses tomorrow.
+    """
+    now = _utc_now()
+    raw = str(deadline or "").strip()
+    if not raw:
+        return now + timedelta(minutes=max(1, int(estimated_minutes or 30)))
+    low = raw.lower().replace(" ", "")
+    if low.startswith("+"):
+        return now + timedelta(minutes=parse_minutes_token(low, max(1, int(estimated_minutes or 30))))
+    try:
+        if "T" in raw:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        pass
+    match = re.search(r"(\d{1,2})\s*:\s*(\d{2})", raw)
+    if match:
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        hour = max(0, min(hour, 23))
+        minute = max(0, min(minute, 59))
+        candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if candidate <= now:
+            candidate += timedelta(days=1)
+        return candidate
+    return now + timedelta(minutes=max(1, int(estimated_minutes or 30)))
+
+
+def checkpoint_at_for(deadline_at: datetime, estimated_minutes: int = 30) -> datetime:
+    now = _utc_now()
+    remaining = max(1, int((deadline_at - now).total_seconds() // 60))
+    if remaining <= 3:
+        return now + timedelta(minutes=1)
+    lead = min(15, max(2, int((estimated_minutes or 30) // 2)))
+    candidate = deadline_at - timedelta(minutes=lead)
+    if candidate <= now:
+        candidate = now + timedelta(minutes=1)
+    return candidate
+
+
+def format_time_for_bot(value: str) -> str:
+    if not value:
+        return "نامشخص"
+    try:
+        dt = datetime.fromisoformat(str(value))
+        return dt.strftime("%H:%M")
+    except Exception:
+        return str(value)
+
+
+def json_dumps_safe(value: Dict[str, Any]) -> str:
+    return json.dumps(value or {}, ensure_ascii=False)
+
+
+def json_loads_safe(value: Optional[str]) -> Dict[str, Any]:
+    try:
+        return json.loads(value or "{}")
+    except Exception:
+        return {}
+
+
+def record_bot_notification(conn, telegram_id: str, task_id: Optional[int], kind: str, message_text: str, ok: bool, error: Optional[str] = None) -> None:
+    conn.execute(
+        """
+        INSERT INTO bot_notifications_log (telegram_id, task_id, kind, message_text, sent_at, ok, error)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (str(telegram_id), task_id, kind, message_text[:4000], now_iso(), 1 if ok else 0, error)
+    )
+
+
+def send_bot_message_logged(telegram_id: str, text: str, task_id: Optional[int] = None, kind: str = "message") -> bool:
+    ok = send_bot_message(telegram_id, text)
+    try:
+        with get_db() as conn:
+            record_bot_notification(conn, telegram_id, task_id, kind, text, ok, None if ok else "telegram_send_failed")
+            conn.commit()
+    except Exception as exc:
+        print(f"[bot_notification_log_failed] {exc}")
+    return ok
+
+
+def create_bot_interaction(conn, telegram_id: str, task_id: Optional[int], interaction_type: str, expected_reply_type: str, payload: Optional[Dict[str, Any]] = None) -> int:
+    # close older open interactions for this user to avoid routing ambiguity
+    conn.execute(
+        """
+        UPDATE bot_interactions
+        SET status = 'superseded', closed_at = ?
+        WHERE telegram_id = ? AND status = 'open'
+        """,
+        (now_iso(), str(telegram_id))
+    )
+    cursor = conn.execute(
+        """
+        INSERT INTO bot_interactions (telegram_id, task_id, interaction_type, expected_reply_type, payload_json, status, created_at)
+        VALUES (?, ?, ?, ?, ?, 'open', ?)
+        """,
+        (str(telegram_id), task_id, interaction_type, expected_reply_type, json_dumps_safe(payload or {}), now_iso())
+    )
+    interaction_id = cursor.lastrowid
+    if task_id:
+        conn.execute(
+            """
+            UPDATE tasks
+            SET current_interaction_id = ?, last_bot_event_at = ?, updated_at = ?
+            WHERE id = ? AND telegram_id = ?
+            """,
+            (interaction_id, now_iso(), now_iso(), task_id, str(telegram_id))
+        )
+    return interaction_id
+
+
+def close_bot_interaction(conn, interaction_id: int, reply_text: Optional[str] = None, status: str = "closed") -> None:
+    conn.execute(
+        """
+        UPDATE bot_interactions
+        SET status = ?, closed_at = ?, last_reply_text = ?
+        WHERE id = ?
+        """,
+        (status, now_iso(), reply_text, interaction_id)
+    )
+
+
+def latest_open_interaction(conn, telegram_id: str):
+    return conn.execute(
+        """
+        SELECT * FROM bot_interactions
+        WHERE telegram_id = ? AND status = 'open'
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (str(telegram_id),)
+    ).fetchone()
+
+
+def initialize_task_followup_schedule(conn, task_row) -> Dict[str, Any]:
+    task = row_to_dict(task_row) or {}
+    if not task:
+        return {}
+    estimated = int(task.get("estimated_minutes") or 30)
+    deadline_at = parse_deadline_at(task.get("deadline"), estimated)
+    checkpoint_at = checkpoint_at_for(deadline_at, estimated)
+    conn.execute(
+        """
+        UPDATE tasks
+        SET deadline_at = ?, checkpoint_due_at = ?, final_status = 'active',
+            checkpoint_sent_at = NULL, deadline_prompt_sent_at = NULL,
+            proof_requested_at = NULL, follow_up_at = NULL, follow_up_sent_at = NULL,
+            current_interaction_id = NULL, last_bot_event_at = ?, updated_at = ?
+        WHERE id = ? AND telegram_id = ?
+        """,
+        (_iso(deadline_at), _iso(checkpoint_at), now_iso(), now_iso(), task["id"], task["telegram_id"])
+    )
+    return {"deadline_at": _iso(deadline_at), "checkpoint_due_at": _iso(checkpoint_at)}
+
+
+def ensure_task_followup_schedule(conn, task_row) -> Dict[str, Any]:
+    """Ensure an active task has B1 follow-up schedule fields.
+
+    This is intentionally idempotent and used by contract creation, /today, and /bot/tick.
+    It prevents old active tasks or edge-case inserts from silently missing deadline_at/checkpoint_due_at.
+    """
+    task = row_to_dict(task_row) or {}
+    if not task:
+        return {}
+    if task.get("status") != "active":
+        return task_schedule_from_row(task)
+    if not task.get("deadline_at") or not task.get("checkpoint_due_at") or not task.get("final_status"):
+        safe_initialize_task_followup_schedule(conn, task_row)
+        refreshed = fetch_task_by_id(conn, task.get("id"))
+        return task_schedule_from_row(refreshed)
+    return task_schedule_from_row(task)
+
+
+def safe_initialize_task_followup_schedule(conn, task_row) -> Dict[str, Any]:
+    """Try to create B1 schedule without breaking contract creation.
+
+    Contract creation must remain durable even if schedule parsing fails. The Mini App can detect
+    followup.status == schedule_failed and the operator can repair via /execution/followup/backfill.
+    """
+    try:
+        return initialize_task_followup_schedule(conn, task_row)
+    except Exception as exc:
+        task_dict = row_to_dict(task_row) or {}
+        print(f"[followup_schedule_failed] task_id={task_dict.get('id')} error={exc}")
+        return {}
+
+
+def backfill_missing_followup_schedules(conn, limit: int = 50) -> int:
+    """Backfill schedule fields for active tasks created before B1.
+
+    B1F: commit per task. If one task fails, previously repaired rows remain committed
+    and later rows continue. Count only rows that end with a real deadline/checkpoint.
+    """
+    rows = conn.execute(
+        """
+        SELECT * FROM tasks
+        WHERE status = 'active'
+          AND (deadline_at IS NULL OR checkpoint_due_at IS NULL OR final_status IS NULL)
+        ORDER BY id ASC
+        LIMIT ?
+        """,
+        (max(1, min(int(limit or 50), 200)),)
+    ).fetchall()
+    count = 0
+    for row in rows:
+        try:
+            safe_initialize_task_followup_schedule(conn, row)
+            refreshed = fetch_task_by_id(conn, row["id"])
+            schedule = task_schedule_from_row(refreshed)
+            if schedule_is_ready(schedule):
+                conn.commit()
+                count += 1
+            else:
+                conn.rollback()
+        except Exception as exc:
+            conn.rollback()
+            print(f"[followup_backfill_failed] task_id={row['id']} error={exc}")
+    return count
+
+
+def task_schedule_from_row(task_row) -> Dict[str, Any]:
+    task = row_to_dict(task_row) or {}
+    return {
+        "deadline_at": task.get("deadline_at"),
+        "checkpoint_due_at": task.get("checkpoint_due_at"),
+        "checkpoint_sent_at": task.get("checkpoint_sent_at"),
+        "deadline_prompt_sent_at": task.get("deadline_prompt_sent_at"),
+        "proof_requested_at": task.get("proof_requested_at"),
+        "follow_up_at": task.get("follow_up_at"),
+        "follow_up_sent_at": task.get("follow_up_sent_at"),
+        "final_status": task.get("final_status"),
+        "current_interaction_id": task.get("current_interaction_id"),
+    }
+
+
+def schedule_is_ready(schedule: Dict[str, Any]) -> bool:
+    return bool(schedule and schedule.get("deadline_at") and schedule.get("checkpoint_due_at"))
+
+
+def followup_response_from_schedule(schedule: Dict[str, Any]) -> Dict[str, Any]:
+    ready = schedule_is_ready(schedule)
+    return {
+        "status": "scheduled" if ready else "schedule_failed",
+        "deadline_at": schedule.get("deadline_at") if schedule else None,
+        "checkpoint_due_at": schedule.get("checkpoint_due_at") if schedule else None,
+        "requires_backfill": not ready,
+        "warning": None if ready else "قرارداد ذخیره شد، اما زمان‌بندی پیگیری ساخته نشد. /execution/followup/backfill را اجرا کن.",
+        "message": "Bot follow-up schedule created for this contract." if ready else "Contract saved, but follow-up schedule is missing. Run /execution/followup/backfill."
+    }
+
+
+def fetch_task_by_id(conn, task_id: Any):
+    if task_id is None:
+        return None
+    return conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+
+
+def accepted_streak_already_recorded_today(conn, telegram_id: str, exclude_proof_id: Optional[int] = None) -> bool:
+    """Return True if an accepted proof already counted toward today's streak.
+    This prevents multiple accepted proofs on the same UTC date from incrementing streak twice.
+    """
+    today_prefix = today_iso_date() + "%"
+    rows = conn.execute(
+        """
+        SELECT id FROM proofs
+        WHERE telegram_id = ?
+          AND created_at LIKE ?
+          AND review_status IN ('auto_accepted', 'accepted', 'accepted_after_appeal')
+        ORDER BY id ASC
+        LIMIT 5
+        """,
+        (str(telegram_id), today_prefix)
+    ).fetchall()
+    for row in rows:
+        if exclude_proof_id is None or int(row["id"]) != int(exclude_proof_id):
+            return True
+    return False
+
+
+def contract_locked_message(task, validation: Dict[str, Any], schedule: Dict[str, Any]) -> str:
+    task = row_to_dict(task) or task
+    return (
+        "✅ قرارداد قفل شد. حالا من پیگیری می‌کنم.\n\n"
+        f"عنوان: {task['title']}\n"
+        f"تعریف انجام‌شدن: {task['done_definition']}\n"
+        f"موعد: {format_time_for_bot(schedule.get('deadline_at') or task.get('deadline_at'))}\n"
+        f"Checkpoint: {format_time_for_bot(schedule.get('checkpoint_due_at') or task.get('checkpoint_due_at'))}\n"
+        f"نوع اثبات: {task['proof_type']}\n"
+        f"کیفیت قرارداد: {validation.get('quality_score', task.get('contract_quality_score', 0))}/100\n\n"
+        "در موعد مقرر از تو می‌پرسم انجام شد یا نه. اگر گیر کردی، /today یا /status را بزن."
+    )
+
+
+def checkpoint_message(task) -> str:
+    task = row_to_dict(task) or task
+    return (
+        "⏳ چک‌پوینت قبل از شکست\n\n"
+        f"قرارداد #{task['id']}: {task['title']}\n"
+        f"موعد: {format_time_for_bot(task.get('deadline_at') or task.get('deadline'))}\n"
+        "یکی را انتخاب کن:\n"
+        "A) همین حالا ۵ دقیقه شروع کن\n"
+        "B) نسخه کوچک‌تر DONE را انجام بده\n"
+        "C) برنامه اصلی را نگه دار\n\n"
+        "با A، B یا C جواب بده."
+    )
+
+
+def deadline_message(task) -> str:
+    task = row_to_dict(task) or task
+    return (
+        "⏰ موعد قرارداد رسید\n\n"
+        f"قرارداد #{task['id']}: {task['title']}\n"
+        f"DONE: {task.get('done_definition') or 'ثبت نشده'}\n\n"
+        "آیا انجام شد؟\n"
+        "yes / done → ثبت اثبات\n"
+        "miss / no → مسیر بازیابی\n"
+        "defer → انتقال به فردا\n"
+        "snooze 10m → تعویق کوتاه"
+    )
+
+
+def recovery_followup_message(task) -> str:
+    task = row_to_dict(task) or task
+    return (
+        "🔁 پیگیری بازیابی\n\n"
+        f"قرارداد #{task['id']}: {task['title']}\n"
+        f"نسخه بازیابی: {task.get('recovery_micro_commit') or task.get('micro_fallback') or 'ثبت نشده'}\n\n"
+        "آیا نسخه بازیابی را انجام دادی؟ yes یا no"
+    )
+
+
+def fetch_task(conn, task_id: int, telegram_id: str):
+    return conn.execute(
+        "SELECT * FROM tasks WHERE id = ? AND telegram_id = ?",
+        (task_id, str(telegram_id))
+    ).fetchone()
+
+
+def active_task_for_user(conn, telegram_id: str):
+    return conn.execute(
+        """
+        SELECT * FROM tasks
+        WHERE telegram_id = ? AND status = 'active'
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (str(telegram_id),)
+    ).fetchone()
+
+
+def is_done_text(text: str) -> bool:
+    t = str(text or "").strip().lower()
+    return t in {"yes", "y", "done", "/done", "انجام شد", "انجام دادم", "بله", "آره", "اره", "تمام", "ثبت"}
+
+
+def is_miss_text(text: str) -> bool:
+    t = str(text or "").strip().lower()
+    return t in {"no", "n", "miss", "/miss", "نه", "نشد", "انجام نشد", "جا افتاد"}
+
+
+def is_defer_text(text: str) -> bool:
+    return str(text or "").strip().lower() in {"defer", "/defer", "فردا", "تعویق"}
+
+
+def snooze_minutes_from_text(text: str) -> Optional[int]:
+    low = str(text or "").strip().lower()
+    if low.startswith("/snooze") or low.startswith("snooze") or "تعویق" in low:
+        return parse_minutes_token(low, 10)
+    return None
+
+
+def handle_checkpoint_reply(conn, interaction, task, text: str) -> str:
+    task = row_to_dict(task) or task
+    choice = str(text or "").strip().lower()
+    if choice.startswith("/"):
+        choice = choice[1:]
+    choice = choice[:1]
+    if choice == "a":
+        close_bot_interaction(conn, interaction["id"], text)
+        return "شروع کن: فقط ۵ دقیقه. بعد از انجام، done را بزن تا اثبات ثبت کنیم."
+    if choice == "b":
+        smaller = task.get("micro_fallback") or "نسخه کوچک‌تر همین تعهد را انجام بده."
+        conn.execute(
+            """
+            UPDATE tasks
+            SET original_done_definition = COALESCE(original_done_definition, done_definition),
+                done_definition = ?, updated_at = ?, last_bot_event_at = ?
+            WHERE id = ? AND telegram_id = ?
+            """,
+            (smaller, now_iso(), now_iso(), task["id"], task["telegram_id"])
+        )
+        close_bot_interaction(conn, interaction["id"], text)
+        return f"DONE کوچک‌تر شد:\n{smaller}\n\nبعد از انجام، done را بزن."
+    if choice == "c":
+        close_bot_interaction(conn, interaction["id"], text)
+        return "برنامه اصلی حفظ شد. در موعد از تو می‌پرسم انجام شد یا نه."
+    return "فقط A، B یا C را بفرست."
+
+
+def open_proof_request(conn, telegram_id: str, task, source: str = "deadline") -> str:
+    task = row_to_dict(task) or task
+    create_bot_interaction(conn, telegram_id, task["id"], "proof_request", "proof_text", {"source": source})
+    conn.execute(
+        """
+        UPDATE tasks
+        SET proof_requested_at = ?, lifecycle_status = 'proof_requested', last_bot_event_at = ?, updated_at = ?
+        WHERE id = ? AND telegram_id = ?
+        """,
+        (now_iso(), now_iso(), now_iso(), task["id"], telegram_id)
+    )
+    return "📝 متن اثبات کوتاه را بفرست. مثال: فایل را ارسال کردم / لینک خروجی: ..."
+
+
+def handle_deadline_reply(conn, interaction, task, text: str) -> str:
+    task = row_to_dict(task) or task
+    low = str(text or "").strip().lower()
+    if is_done_text(low):
+        close_bot_interaction(conn, interaction["id"], text)
+        return open_proof_request(conn, task["telegram_id"], task, "deadline_done")
+    if is_miss_text(low):
+        close_bot_interaction(conn, interaction["id"], text)
+        create_bot_interaction(conn, task["telegram_id"], task["id"], "miss_cause", "free_text", {})
+        conn.execute(
+            """
+            UPDATE tasks
+            SET lifecycle_status = 'miss_recovery_started', final_status = 'missed_pending_recovery', last_bot_event_at = ?, updated_at = ?
+            WHERE id = ? AND telegram_id = ?
+            """,
+            (now_iso(), now_iso(), task["id"], task["telegram_id"])
+        )
+        return "چه چیزی باعث شد انجام نشود؟ یک جمله کوتاه بفرست."
+    if is_defer_text(low):
+        new_deadline = _utc_now() + timedelta(days=1)
+        new_checkpoint = checkpoint_at_for(new_deadline, int(task.get("estimated_minutes") or 30))
+        conn.execute(
+            """
+            UPDATE tasks
+            SET deadline_at = ?, checkpoint_due_at = ?, checkpoint_sent_at = NULL,
+                deadline_prompt_sent_at = NULL, lifecycle_status = 'deferred', last_bot_event_at = ?, updated_at = ?
+            WHERE id = ? AND telegram_id = ?
+            """,
+            (_iso(new_deadline), _iso(new_checkpoint), now_iso(), now_iso(), task["id"], task["telegram_id"])
+        )
+        close_bot_interaction(conn, interaction["id"], text)
+        return f"به فردا منتقل شد. موعد جدید: {format_time_for_bot(_iso(new_deadline))}"
+    snooze = snooze_minutes_from_text(low)
+    if snooze:
+        new_deadline = _utc_now() + timedelta(minutes=snooze)
+        new_checkpoint = checkpoint_at_for(new_deadline, int(task.get("estimated_minutes") or 30))
+        conn.execute(
+            """
+            UPDATE tasks
+            SET deadline_at = ?, checkpoint_due_at = ?, checkpoint_sent_at = NULL, deadline_prompt_sent_at = NULL,
+                snooze_count = snooze_count + 1, lifecycle_status = 'snoozed', last_bot_event_at = ?, updated_at = ?
+            WHERE id = ? AND telegram_id = ?
+            """,
+            (_iso(new_deadline), _iso(new_checkpoint), now_iso(), now_iso(), task["id"], task["telegram_id"])
+        )
+        close_bot_interaction(conn, interaction["id"], text)
+        return f"تعویق شد. {snooze} دقیقه دیگر دوباره می‌پرسم."
+    return "جواب معتبر: yes / done / miss / defer / snooze 10m"
+
+
+def handle_recovery_reply(conn, interaction, task, text: str) -> str:
+    task = row_to_dict(task) or task
+    itype = interaction["interaction_type"]
+    if itype == "miss_cause":
+        conn.execute("UPDATE tasks SET miss_cause = ?, updated_at = ? WHERE id = ? AND telegram_id = ?", (text, now_iso(), task["id"], task["telegram_id"]))
+        close_bot_interaction(conn, interaction["id"], text)
+        create_bot_interaction(conn, task["telegram_id"], task["id"], "controllable_factor", "free_text", {})
+        return "کدام بخش این مشکل تحت کنترل تو بود؟ یک جمله کوتاه بفرست."
+    if itype == "controllable_factor":
+        conn.execute("UPDATE tasks SET controllable_factor = ?, updated_at = ? WHERE id = ? AND telegram_id = ?", (text, now_iso(), task["id"], task["telegram_id"]))
+        close_bot_interaction(conn, interaction["id"], text)
+        create_bot_interaction(conn, task["telegram_id"], task["id"], "recovery_micro_commit", "free_text", {})
+        return "نسخه ۲ دقیقه‌ای بازیابی چیست؟ مثال: فقط ۳ خط بنویسم."
+    if itype == "recovery_micro_commit":
+        follow_up = _utc_now() + timedelta(minutes=2)
+        conn.execute(
+            """
+            UPDATE tasks
+            SET recovery_micro_commit = ?, follow_up_at = ?, follow_up_sent_at = NULL,
+                lifecycle_status = 'recovery_scheduled', updated_at = ?
+            WHERE id = ? AND telegram_id = ?
+            """,
+            (text, _iso(follow_up), now_iso(), task["id"], task["telegram_id"])
+        )
+        close_bot_interaction(conn, interaction["id"], text)
+        return f"بازیابی ثبت شد. دو دقیقه دیگر پیگیری می‌کنم: {text}"
+    if itype == "recovery_followup":
+        close_bot_interaction(conn, interaction["id"], text)
+        if is_done_text(text):
+            return open_proof_request(conn, task["telegram_id"], task, "recovery_done")
+        conn.execute(
+            """
+            UPDATE tasks
+            SET final_status = 'missed', lifecycle_status = 'missed', follow_up_completed_at = ?, updated_at = ?
+            WHERE id = ? AND telegram_id = ?
+            """,
+            (now_iso(), now_iso(), task["id"], task["telegram_id"])
+        )
+        return "ثبت شد. این قرارداد missed شد؛ برای ادامه یک قرارداد کوچک‌تر بساز."
+    return "پیام دریافت شد."
+
+
+def handle_proof_reply(conn, interaction, task, text: str) -> str:
+    task = row_to_dict(task) or task
+    close_bot_interaction(conn, interaction["id"], text)
+    # SQLite cannot open the second create_proof() connection while this transaction holds a write lock.
+    # PostgreSQL does not need this extra commit, so we avoid the B1 double-commit issue there.
+    if DB_BACKEND == "sqlite":
+        conn.commit()
+    try:
+        result = create_proof(ProofCreateRequest(telegram_id=str(task["telegram_id"]), task_id=int(task["id"]), proof_text=str(text or "")))
+        code = result.get("code")
+        if code == "duplicate_proof":
+            return "⚠️ ثبت تکراری معتبر نیست. برای این قرارداد قبلاً اثبات ثبت شده است."
+        validation = result.get("proof_validation") or {}
+        return (
+            "✅ اثبات دریافت و در backend ثبت شد.\n"
+            f"وضعیت: {review_status_label_fa(validation.get('review_status'))}\n"
+            f"امتیاز اثبات: {validation.get('proof_quality_score', 0)}/100\n"
+            "از /dashboard یا Mini App وضعیت را ببین."
+        )
+    except Exception as exc:
+        create_bot_interaction(conn, task["telegram_id"], task["id"], "proof_request", "proof_text", {"retry": True})
+        return f"ثبت اثبات خطا داد: {exc}\nلطفاً دوباره متن اثبات را بفرست."
+
+
+def handle_bot_execution_reply(telegram_id: str, text: str, first_name: str = "کاربر", username: Optional[str] = None) -> bool:
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    low = raw.lower()
+    if low.startswith(("/start", "/status", "/today", "/dashboard", "/team", "/witness", "/history", "/help")):
+        return False
+
+    with get_db() as conn:
+        ensure_user_exists(conn, str(telegram_id), first_name=first_name, username=username)
+        interaction = latest_open_interaction(conn, str(telegram_id))
+        task = None
+        if interaction is not None and interaction["task_id"]:
+            task = fetch_task(conn, int(interaction["task_id"]), str(telegram_id))
+        if task is None:
+            task = active_task_for_user(conn, str(telegram_id))
+
+        if interaction is None:
+            if task is None:
+                return False
+            if is_done_text(raw):
+                reply = open_proof_request(conn, str(telegram_id), task, "manual_done")
+                conn.commit()
+                send_bot_message_logged(str(telegram_id), reply, task["id"], "manual_done")
+                return True
+            if is_miss_text(raw):
+                interaction_id = create_bot_interaction(conn, str(telegram_id), task["id"], "miss_cause", "free_text", {})
+                conn.commit()
+                send_bot_message_logged(str(telegram_id), "چه چیزی باعث شد انجام نشود؟ یک جمله کوتاه بفرست.", task["id"], "manual_miss")
+                return True
+            snooze = snooze_minutes_from_text(raw)
+            if snooze:
+                new_deadline = _utc_now() + timedelta(minutes=snooze)
+                new_checkpoint = checkpoint_at_for(new_deadline, int(task.get("estimated_minutes") or 30))
+                conn.execute("UPDATE tasks SET deadline_at = ?, checkpoint_due_at = ?, checkpoint_sent_at = NULL, deadline_prompt_sent_at = NULL, updated_at = ? WHERE id = ? AND telegram_id = ?", (_iso(new_deadline), _iso(new_checkpoint), now_iso(), task["id"], str(telegram_id)))
+                conn.commit()
+                send_bot_message_logged(str(telegram_id), f"تعویق شد. {snooze} دقیقه دیگر دوباره می‌پرسم.", task["id"], "manual_snooze")
+                return True
+            return False
+
+        if task is None:
+            close_bot_interaction(conn, interaction["id"], raw, "closed_missing_task")
+            conn.commit()
+            send_bot_message_logged(str(telegram_id), "قرارداد مربوط به این تعامل پیدا نشد. /today را بزن.", None, "missing_task")
+            return True
+
+        itype = interaction["interaction_type"]
+        if itype == "checkpoint":
+            reply = handle_checkpoint_reply(conn, interaction, task, raw)
+        elif itype == "deadline":
+            reply = handle_deadline_reply(conn, interaction, task, raw)
+        elif itype == "proof_request":
+            reply = handle_proof_reply(conn, interaction, task, raw)
+            conn.commit()
+            send_bot_message_logged(str(telegram_id), reply, task["id"], "proof_reply")
+            return True
+        elif itype in {"miss_cause", "controllable_factor", "recovery_micro_commit", "recovery_followup"}:
+            reply = handle_recovery_reply(conn, interaction, task, raw)
+        else:
+            reply = "پیام دریافت شد. /today را بزن تا وضعیت فعلی را ببینی."
+            close_bot_interaction(conn, interaction["id"], raw)
+
+        conn.commit()
+        send_bot_message_logged(str(telegram_id), reply, task["id"], f"interaction_{itype}")
+        return True
+
+
+def process_due_execution_loop(limit: int = 25) -> Dict[str, Any]:
+    now = _iso(_utc_now())
+    processed = {"checkpoint": 0, "deadline": 0, "recovery_followup": 0, "backfilled": 0}
+    messages = []
+
+    def _send_due(conn, task, kind: str, message_text: str, interaction_type: str, expected_reply_type: str, sent_column: str, lifecycle_status: str) -> bool:
+        ok = send_bot_message(task["telegram_id"], message_text)
+        record_bot_notification(conn, task["telegram_id"], task["id"], kind, message_text, ok, None if ok else "telegram_send_failed")
+        if ok:
+            create_bot_interaction(conn, task["telegram_id"], task["id"], interaction_type, expected_reply_type, {})
+            conn.execute(
+                f"UPDATE tasks SET {sent_column} = ?, lifecycle_status = ?, updated_at = ?, last_bot_event_at = ? WHERE id = ?",
+                (now_iso(), lifecycle_status, now_iso(), now_iso(), task["id"])
+            )
+            # Commit at the smallest safe unit so a later task failure cannot rollback an already-sent message.
+            conn.commit()
+        return ok
+
+    with get_db() as conn:
+        processed["backfilled"] = backfill_missing_followup_schedules(conn, limit=max(limit * 2, 25))
+        checkpoint_rows = conn.execute(
+            """
+            SELECT * FROM tasks
+            WHERE status = 'active' AND checkpoint_due_at IS NOT NULL
+              AND checkpoint_sent_at IS NULL AND checkpoint_due_at <= ?
+            ORDER BY checkpoint_due_at ASC
+            LIMIT ?
+            """,
+            (now, limit)
+        ).fetchall()
+        for task in checkpoint_rows:
+            try:
+                msg = checkpoint_message(task)
+                ok = _send_due(conn, task, "checkpoint", msg, "checkpoint", "choice_abc", "checkpoint_sent_at", "checkpoint_sent")
+                conn.commit()
+                processed["checkpoint"] += 1
+                messages.append({"kind": "checkpoint", "task_id": task["id"], "telegram_id": task["telegram_id"], "sent": ok})
+            except Exception as exc:
+                conn.rollback()
+                messages.append({"kind": "checkpoint", "task_id": task["id"], "telegram_id": task["telegram_id"], "error": str(exc)})
+
+        deadline_rows = conn.execute(
+            """
+            SELECT * FROM tasks
+            WHERE status = 'active' AND deadline_at IS NOT NULL
+              AND completed_at IS NULL AND deadline_prompt_sent_at IS NULL AND deadline_at <= ?
+            ORDER BY deadline_at ASC
+            LIMIT ?
+            """,
+            (now, limit)
+        ).fetchall()
+        for task in deadline_rows:
+            try:
+                msg = deadline_message(task)
+                ok = _send_due(conn, task, "deadline", msg, "deadline", "done_miss_defer_snooze", "deadline_prompt_sent_at", "deadline_prompt_sent")
+                conn.commit()
+                processed["deadline"] += 1
+                messages.append({"kind": "deadline", "task_id": task["id"], "telegram_id": task["telegram_id"], "sent": ok})
+            except Exception as exc:
+                conn.rollback()
+                messages.append({"kind": "deadline", "task_id": task["id"], "telegram_id": task["telegram_id"], "error": str(exc)})
+
+        recovery_rows = conn.execute(
+            """
+            SELECT * FROM tasks
+            WHERE status = 'active' AND follow_up_at IS NOT NULL
+              AND follow_up_sent_at IS NULL AND follow_up_at <= ?
+            ORDER BY follow_up_at ASC
+            LIMIT ?
+            """,
+            (now, limit)
+        ).fetchall()
+        for task in recovery_rows:
+            try:
+                msg = recovery_followup_message(task)
+                ok = _send_due(conn, task, "recovery_followup", msg, "recovery_followup", "yes_no", "follow_up_sent_at", "recovery_followup_sent")
+                conn.commit()
+                processed["recovery_followup"] += 1
+                messages.append({"kind": "recovery_followup", "task_id": task["id"], "telegram_id": task["telegram_id"], "sent": ok})
+            except Exception as exc:
+                conn.rollback()
+                messages.append({"kind": "recovery_followup", "task_id": task["id"], "telegram_id": task["telegram_id"], "error": str(exc)})
+
+        conn.commit()
+    return {"ok": True, "time": now_iso(), "processed": processed, "messages": messages, "version": B1_EXECUTION_LOOP_VERSION}
+
 def build_task_lifecycle(conn: sqlite3.Connection, task_row) -> Dict[str, Any]:
     task = row_to_dict(task_row)
     if not task:
@@ -564,6 +1285,15 @@ def build_task_lifecycle(conn: sqlite3.Connection, task_row) -> Dict[str, Any]:
         "execution_date": task.get("execution_date"),
         "submitted_at": task.get("submitted_at"),
         "completed_at": task.get("completed_at"),
+        "deadline_at": task.get("deadline_at"),
+        "checkpoint_due_at": task.get("checkpoint_due_at"),
+        "checkpoint_sent_at": task.get("checkpoint_sent_at"),
+        "deadline_prompt_sent_at": task.get("deadline_prompt_sent_at"),
+        "proof_requested_at": task.get("proof_requested_at"),
+        "follow_up_at": task.get("follow_up_at"),
+        "follow_up_sent_at": task.get("follow_up_sent_at"),
+        "final_status": task.get("final_status"),
+        "current_interaction_id": task.get("current_interaction_id"),
         "message": message
     }
 
@@ -580,18 +1310,30 @@ def close_previous_active_contracts(conn: sqlite3.Connection, telegram_id: str) 
     if not rows:
         return 0
 
+    closed_at = now_iso()
     conn.execute(
         """
         UPDATE tasks
         SET status = 'superseded',
             lifecycle_status = 'superseded',
+            final_status = 'superseded',
             integrity_status = 'superseded_by_new_contract',
+            current_interaction_id = NULL,
             closed_at = ?,
             close_reason = 'replaced_by_new_contract',
             updated_at = ?
         WHERE telegram_id = ? AND status = 'active'
         """,
-        (now_iso(), now_iso(), telegram_id)
+        (closed_at, closed_at, telegram_id)
+    )
+
+    conn.execute(
+        """
+        UPDATE bot_interactions
+        SET status = 'closed', closed_at = ?, last_reply_text = 'closed_by_new_contract'
+        WHERE telegram_id = ? AND status = 'open'
+        """,
+        (closed_at, telegram_id)
     )
 
     return len(rows)
@@ -671,7 +1413,9 @@ def apply_review_award(
 
     old_stage = user["guardian_stage"]
     new_xp = int(user["xp"]) + xp_award
-    new_streak = int(user["streak_days"]) + 1
+    prior_accepted_today = accepted_streak_already_recorded_today(conn, telegram_id, exclude_proof_id=proof_dict["id"])
+    streak_delta = 0 if prior_accepted_today else 1
+    new_streak = int(user["streak_days"]) + streak_delta
     new_verified_count = int(user["verified_proofs_count"]) + 1
     new_stage = calculate_stage(new_streak, new_verified_count)
     reviewed_at = now_iso()
@@ -739,7 +1483,7 @@ def apply_review_award(
             xp_award,
             old_stage,
             new_stage,
-            f"proof_id={proof_dict['id']};task_id={task_dict['id']};reviewer_id={reviewer_id}",
+            f"proof_id={proof_dict['id']};task_id={task_dict['id']};reviewer_id={reviewer_id};streak_delta={streak_delta}",
             reviewed_at,
         )
     )
@@ -1015,6 +1759,52 @@ def create_base_tables_sqlite(conn) -> None:
     """)
 
 
+def create_b1h_cron_tables(conn) -> None:
+    """Create cron lock/run tables for the secure B1H tick runner."""
+    if DB_BACKEND == "postgres":
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_cron_runs (
+                id SERIAL PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                source TEXT,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                processed_json TEXT,
+                error TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_cron_locks (
+                name TEXT PRIMARY KEY,
+                locked_until TEXT,
+                run_id TEXT,
+                updated_at TEXT
+            )
+        """)
+    else:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_cron_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                source TEXT,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                processed_json TEXT,
+                error TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_cron_locks (
+                name TEXT PRIMARY KEY,
+                locked_until TEXT,
+                run_id TEXT,
+                updated_at TEXT
+            )
+        """)
+
+
 def init_db():
     with get_db() as conn:
         if DB_BACKEND == "postgres":
@@ -1070,6 +1860,81 @@ def init_db():
         ensure_column(conn, "proofs", "awarded_after_review", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "proofs", "witness_status", "TEXT NOT NULL DEFAULT 'none'")
         ensure_column(conn, "proofs", "witness_confirmed_count", "INTEGER NOT NULL DEFAULT 0")
+
+        # B1 execution follow-up loop fields.
+        ensure_column(conn, "tasks", "deadline_at", "TEXT")
+        ensure_column(conn, "tasks", "checkpoint_due_at", "TEXT")
+        ensure_column(conn, "tasks", "checkpoint_sent_at", "TEXT")
+        ensure_column(conn, "tasks", "deadline_prompt_sent_at", "TEXT")
+        ensure_column(conn, "tasks", "proof_requested_at", "TEXT")
+        ensure_column(conn, "tasks", "follow_up_at", "TEXT")
+        ensure_column(conn, "tasks", "follow_up_sent_at", "TEXT")
+        ensure_column(conn, "tasks", "follow_up_completed_at", "TEXT")
+        ensure_column(conn, "tasks", "final_status", "TEXT")
+        ensure_column(conn, "tasks", "current_interaction_id", "INTEGER")
+        ensure_column(conn, "tasks", "last_bot_event_at", "TEXT")
+        ensure_column(conn, "tasks", "miss_cause", "TEXT")
+        ensure_column(conn, "tasks", "controllable_factor", "TEXT")
+        ensure_column(conn, "tasks", "recovery_micro_commit", "TEXT")
+        ensure_column(conn, "tasks", "snooze_count", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "tasks", "original_done_definition", "TEXT")
+
+        if DB_BACKEND == "postgres":
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS bot_interactions (
+                    id SERIAL PRIMARY KEY,
+                    telegram_id TEXT NOT NULL,
+                    task_id INTEGER,
+                    interaction_type TEXT NOT NULL,
+                    expected_reply_type TEXT NOT NULL,
+                    payload_json TEXT,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    created_at TEXT NOT NULL,
+                    closed_at TEXT,
+                    last_reply_text TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS bot_notifications_log (
+                    id SERIAL PRIMARY KEY,
+                    telegram_id TEXT NOT NULL,
+                    task_id INTEGER,
+                    kind TEXT NOT NULL,
+                    message_text TEXT,
+                    sent_at TEXT NOT NULL,
+                    ok INTEGER NOT NULL DEFAULT 0,
+                    error TEXT
+                )
+            """)
+        else:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS bot_interactions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_id TEXT NOT NULL,
+                    task_id INTEGER,
+                    interaction_type TEXT NOT NULL,
+                    expected_reply_type TEXT NOT NULL,
+                    payload_json TEXT,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    created_at TEXT NOT NULL,
+                    closed_at TEXT,
+                    last_reply_text TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS bot_notifications_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_id TEXT NOT NULL,
+                    task_id INTEGER,
+                    kind TEXT NOT NULL,
+                    message_text TEXT,
+                    sent_at TEXT NOT NULL,
+                    ok INTEGER NOT NULL DEFAULT 0,
+                    error TEXT
+                )
+            """)
+
+        create_b1h_cron_tables(conn)
 
         conn.commit()
 
@@ -1153,6 +2018,15 @@ class WitnessRespondRequest(BaseModel):
     note: Optional[str] = None
 
 
+
+class BotReplyRequest(BaseModel):
+    telegram_id: str
+    text: str
+    first_name: Optional[str] = "کاربر"
+    username: Optional[str] = None
+    token: Optional[str] = None
+
+
 @app.get("/")
 def root():
     return {
@@ -1161,7 +2035,7 @@ def root():
         "database": DB_PATH,
         "db_backend": DB_BACKEND,
         "database_url_configured": bool(DATABASE_URL),
-        "version": "0.13.0-bot-command-center-v1"
+        "version": "0.14.9-b1m-webhook-lock-security-fixes-v1"
     }
 
 
@@ -1174,7 +2048,7 @@ def health():
         "db_backend": DB_BACKEND,
         "database_url_configured": bool(DATABASE_URL),
         "bot_token_configured": bool(BOT_TOKEN),
-        "version": "0.13.0-bot-command-center-v1"
+        "version": "0.14.9-b1m-webhook-lock-security-fixes-v1"
     }
 
 
@@ -1216,7 +2090,8 @@ def bot_status():
 
 
 @app.post("/bot/test-message")
-def bot_test_message(telegram_id: str):
+def bot_test_message(telegram_id: str, token: Optional[str] = None, x_bot_tick_token: Optional[str] = Header(None, alias="X-Bot-Tick-Token")):
+    validate_bot_tick_token(token, x_bot_tick_token)
     sent = send_bot_message(
         telegram_id,
         "✅ اتصال بک‌اند به بات فعال است.\n\nاین پیام تست از Render Backend ارسال شده است."
@@ -1330,7 +2205,11 @@ def bot_features_text() -> str:
         "/team — تیم من\n"
         "/witness — شاهدها\n"
         "/history — تاریخچه\n"
-        "/help — راهنما"
+        "/help — راهنما\n"
+        "/done — اعلام انجام و شروع ثبت اثبات\n"
+        "/miss — شروع مسیر بازیابی\n"
+        "/defer — انتقال موعد\n"
+        "/snooze 10m — تعویق کوتاه"
     )
 
 
@@ -1584,7 +2463,7 @@ def handle_bot_command(chat_id: str, command: str, first_name: str = "کاربر
 def features():
     return {
         "ok": True,
-        "version": "0.13.0-bot-command-center-v1",
+        "version": "0.14.9-b1m-webhook-lock-security-fixes-v1",
         "bot_command_version": BOT_COMMAND_VERSION,
         "features": [
             "contract_core",
@@ -1598,7 +2477,8 @@ def features():
             "postgres_persistence",
             "team_core",
             "witness_flow",
-            "bot_command_center"
+            "bot_command_center",
+            "b1_execution_followup_loop"
         ]
     }
 
@@ -1616,22 +2496,34 @@ def bot_commands_preview():
             "/team",
             "/witness",
             "/history",
-            "/help"
+            "/help",
+            "/done",
+            "/miss",
+            "/defer",
+            "/snooze 10m"
         ],
         "keyboard": bot_main_keyboard()
     }
 
 
 @app.get("/bot/set-webhook")
-def bot_set_webhook(url: Optional[str] = None):
+def bot_set_webhook(
+    url: Optional[str] = None,
+    token: Optional[str] = None,
+    x_bot_tick_token: Optional[str] = Header(None, alias="X-Bot-Tick-Token")
+):
+    validate_bot_tick_token(token, x_bot_tick_token)
     if not BOT_TOKEN:
         raise HTTPException(status_code=503, detail="BOT_TOKEN تنظیم نشده است")
 
     webhook_url = (url or "https://royal-guardian-backend.onrender.com/bot/webhook").strip()
-    result = telegram_api_call("setWebhook", {
+    payload = {
         "url": webhook_url,
         "allowed_updates": ["message", "callback_query"]
-    })
+    }
+    if TELEGRAM_WEBHOOK_SECRET_TOKEN:
+        payload["secret_token"] = TELEGRAM_WEBHOOK_SECRET_TOKEN
+    result = telegram_api_call("setWebhook", payload)
     return {
         "ok": bool(result.get("ok")),
         "webhook_url": webhook_url,
@@ -1649,7 +2541,11 @@ def bot_webhook_info():
 
 
 @app.get("/bot/delete-webhook")
-def bot_delete_webhook():
+def bot_delete_webhook(
+    token: Optional[str] = None,
+    x_bot_tick_token: Optional[str] = Header(None, alias="X-Bot-Tick-Token")
+):
+    validate_bot_tick_token(token, x_bot_tick_token)
     result = telegram_api_call("deleteWebhook", {})
     return {
         "ok": bool(result.get("ok")),
@@ -1658,7 +2554,8 @@ def bot_delete_webhook():
 
 
 @app.post("/bot/webhook")
-def bot_webhook(update: Dict[str, Any]):
+def bot_webhook(update: Dict[str, Any], x_telegram_bot_api_secret_token: Optional[str] = Header(None, alias="X-Telegram-Bot-Api-Secret-Token")):
+    validate_telegram_webhook_secret(x_telegram_bot_api_secret_token)
     try:
         if "callback_query" in update:
             callback = update["callback_query"]
@@ -1709,11 +2606,14 @@ def bot_webhook(update: Dict[str, Any]):
                 "type": "non_text"
             }
 
-        handle_bot_command(chat_id, text, first_name=first_name, username=username)
+        handled_execution = handle_bot_execution_reply(chat_id, text, first_name=first_name, username=username)
+        if not handled_execution:
+            handle_bot_command(chat_id, text, first_name=first_name, username=username)
 
         return {
             "ok": True,
             "handled": True,
+            "handled_execution": handled_execution,
             "text": text
         }
 
@@ -1723,6 +2623,26 @@ def bot_webhook(update: Dict[str, Any]):
             "ok": False,
             "error": str(exc)
         }
+
+
+@app.post("/bot/reply")
+def bot_reply(payload: BotReplyRequest, x_bot_tick_token: Optional[str] = Header(None, alias="X-Bot-Tick-Token")):
+    validate_bot_tick_token(payload.token, x_bot_tick_token)
+    telegram_id = str(payload.telegram_id or "").strip()
+    text = str(payload.text or "").strip()
+    if not telegram_id:
+        raise HTTPException(status_code=400, detail="شناسه تلگرام الزامی است")
+    if not text:
+        raise HTTPException(status_code=400, detail="متن پاسخ الزامی است")
+    handled_execution = handle_bot_execution_reply(
+        telegram_id,
+        text,
+        first_name=payload.first_name or "کاربر",
+        username=payload.username
+    )
+    if not handled_execution:
+        handle_bot_command(telegram_id, text, first_name=payload.first_name or "کاربر", username=payload.username)
+    return {"ok": True, "handled_execution": handled_execution, "telegram_id": telegram_id, "text": text}
 
 
 def ensure_user_exists(conn: sqlite3.Connection, telegram_id: str, first_name: str = "کاربر", username: Optional[str] = None):
@@ -1745,9 +2665,9 @@ def ensure_user_exists(conn: sqlite3.Connection, telegram_id: str, first_name: s
                 telegram_id,
                 first_name or "کاربر",
                 username,
-                240,
-                5,
-                "شکاف طلایی",
+                0,
+                0,
+                "هسته خاموش",
                 0,
                 created,
                 created
@@ -1800,6 +2720,198 @@ def normalize_contract_payload(data: TaskCreateRequest) -> Dict[str, Any]:
     }
 
 
+def validate_bot_tick_token(token: Optional[str] = None, header_token: Optional[str] = None) -> None:
+    """Protect execution-loop triggers and manual bot reply tests.
+
+    Production behavior is fail-closed: BOT_TICK_TOKEN must be configured and supplied.
+    Local developer exception:
+      BOT_TICK_ALLOW_DEV_NO_TOKEN=1 is honored only when running SQLite fallback
+      (i.e. DATABASE_URL is not configured). This keeps Render/Postgres protected while
+      allowing local smoke tests without a .env file.
+    """
+    supplied = (header_token or token or "").strip()
+    if not BOT_TICK_TOKEN:
+        if BOT_TICK_ALLOW_DEV_NO_TOKEN and DB_BACKEND == "sqlite":
+            return
+        raise HTTPException(status_code=403, detail="BOT_TICK_TOKEN is not configured")
+    if supplied != BOT_TICK_TOKEN:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+
+def validate_bot_cron_token(token: Optional[str] = None, header_token: Optional[str] = None) -> None:
+    """Protect the scheduled cron endpoint.
+
+    BOT_CRON_TOKEN is preferred. If it is not configured, BOT_TICK_TOKEN is used as the fallback.
+    Production remains fail-closed if neither exists. Local SQLite can opt into the same
+    BOT_TICK_ALLOW_DEV_NO_TOKEN escape hatch for smoke tests.
+    """
+    supplied = (header_token or token or "").strip()
+    expected = BOT_CRON_TOKEN or BOT_TICK_TOKEN
+    if not expected:
+        if BOT_TICK_ALLOW_DEV_NO_TOKEN and DB_BACKEND == "sqlite":
+            return
+        raise HTTPException(status_code=403, detail="BOT_CRON_TOKEN/BOT_TICK_TOKEN is not configured")
+    if supplied != expected:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+
+def validate_telegram_webhook_secret(header_token: Optional[str]) -> None:
+    if TELEGRAM_WEBHOOK_SECRET_TOKEN and header_token != TELEGRAM_WEBHOOK_SECRET_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid Telegram webhook secret")
+
+
+def cron_lock_row(conn, name: str = "bot_tick"):
+    return conn.execute(
+        "SELECT * FROM bot_cron_locks WHERE name = ?",
+        (name,)
+    ).fetchone()
+
+
+def parse_cron_locked_until(value) -> Optional[datetime]:
+    """Parse cron lock timestamp robustly for SQLite strings and PostgreSQL timestamps."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    raw = str(value).strip()
+    if not raw:
+        return None
+    raw = raw.replace("Z", "")
+    if "+" in raw:
+        raw = raw.split("+", 1)[0]
+    raw = raw.replace(" UTC", "").strip()
+    if " " in raw and "T" not in raw:
+        raw = raw.replace(" ", "T", 1)
+    try:
+        return datetime.fromisoformat(raw)
+    except Exception:
+        return None
+
+
+def acquire_cron_lock(conn, *, source: str = "cron", lock_seconds: int = None) -> Dict[str, Any]:
+    lock_seconds = int(lock_seconds or BOT_CRON_LOCK_SECONDS or 120)
+    lock_seconds = max(15, min(lock_seconds, 15 * 60))
+    now = _iso(_utc_now())
+    row = cron_lock_row(conn)
+    locked_until_dt = parse_cron_locked_until(row["locked_until"]) if row and row["locked_until"] else None
+    if locked_until_dt and locked_until_dt > _utc_now():
+        return {
+            "acquired": False,
+            "locked_until": row["locked_until"],
+            "run_id": row["run_id"],
+        }
+
+    run_id = secrets.token_hex(12)
+    locked_until = _iso(_utc_now() + timedelta(seconds=lock_seconds))
+
+    if row:
+        conn.execute(
+            """
+            UPDATE bot_cron_locks
+            SET locked_until = ?, run_id = ?, updated_at = ?
+            WHERE name = ?
+            """,
+            (locked_until, run_id, now, "bot_tick")
+        )
+    else:
+        try:
+            conn.execute(
+                """
+                INSERT INTO bot_cron_locks (name, locked_until, run_id, updated_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                ("bot_tick", locked_until, run_id, now)
+            )
+        except Exception as exc:
+            conn.rollback()
+            current = cron_lock_row(conn)
+            return {
+                "acquired": False,
+                "reason": "concurrent_lock",
+                "locked_until": current["locked_until"] if current else None,
+                "run_id": current["run_id"] if current else None,
+                "error": str(exc)
+            }
+
+    conn.execute(
+        """
+        INSERT INTO bot_cron_runs (run_id, source, status, started_at, processed_json, error)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (run_id, source, "running", now, None, None)
+    )
+    conn.commit()
+    return {
+        "acquired": True,
+        "run_id": run_id,
+        "locked_until": locked_until,
+    }
+
+
+def finish_cron_run(conn, run_id: str, *, status: str, processed: Optional[Dict[str, Any]] = None, error: Optional[str] = None) -> None:
+    finished = _iso(_utc_now())
+    conn.execute(
+        """
+        UPDATE bot_cron_runs
+        SET status = ?, finished_at = ?, processed_json = ?, error = ?
+        WHERE run_id = ?
+        """,
+        (status, finished, json.dumps(processed or {}, ensure_ascii=False), error, run_id)
+    )
+    conn.execute(
+        """
+        UPDATE bot_cron_locks
+        SET locked_until = ?, updated_at = ?
+        WHERE name = ? AND run_id = ?
+        """,
+        (finished, finished, "bot_tick", run_id)
+    )
+    conn.commit()
+
+
+def cron_runs_snapshot(conn, limit: int = 10):
+    return conn.execute(
+        """
+        SELECT id, run_id, source, status, started_at, finished_at, processed_json, error
+        FROM bot_cron_runs
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (max(1, min(int(limit or 10), 50)),)
+    ).fetchall()
+
+
+def run_secure_cron_tick(*, source: str = "cron", limit: int = 25, lock_seconds: int = None) -> Dict[str, Any]:
+    with get_db() as conn:
+        lock = acquire_cron_lock(conn, source=source, lock_seconds=lock_seconds)
+    if not lock.get("acquired"):
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "locked",
+            "run_id": lock.get("run_id"),
+            "locked_until": lock.get("locked_until"),
+            "version": B1_EXECUTION_LOOP_VERSION,
+        }
+
+    run_id = lock["run_id"]
+    try:
+        processed = process_due_execution_loop(limit=max(1, min(int(limit or 25), 100)))
+        with get_db() as conn:
+            finish_cron_run(conn, run_id, status="completed", processed=processed, error=None)
+        return {
+            "ok": True,
+            "skipped": False,
+            "run_id": run_id,
+            "processed": processed,
+            "version": B1_EXECUTION_LOOP_VERSION,
+        }
+    except Exception as exc:
+        with get_db() as conn:
+            finish_cron_run(conn, run_id, status="failed", processed=None, error=str(exc))
+        raise
+
+
 def create_contract_record(data: TaskCreateRequest):
     telegram_id = data.telegram_id.strip()
     if not telegram_id:
@@ -1816,7 +2928,6 @@ def create_contract_record(data: TaskCreateRequest):
 
     with get_db() as conn:
         ensure_user_exists(conn, telegram_id)
-
         close_previous_active_contracts(conn, telegram_id)
 
         created = now_iso()
@@ -1858,39 +2969,309 @@ def create_contract_record(data: TaskCreateRequest):
                 DAILY_LIFECYCLE_VERSION
             )
         )
-        conn.commit()
+        new_task_id = cursor.lastrowid
+        if new_task_id is None:
+            # Safety fallback for unusual DB adapters; PostgresConnection normally returns id via RETURNING.
+            row = conn.execute(
+                """
+                SELECT id FROM tasks
+                WHERE telegram_id = ? AND created_at = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (telegram_id, created)
+            ).fetchone()
+            new_task_id = row["id"] if row else None
 
-        task = conn.execute(
-            "SELECT * FROM tasks WHERE id = ?",
-            (cursor.lastrowid,)
-        ).fetchone()
+        task = fetch_task_by_id(conn, new_task_id)
+        if task is None:
+            raise HTTPException(status_code=500, detail="قرارداد ساخته شد اما خواندن رکورد جدید شکست خورد")
 
-    send_bot_message(
-        telegram_id,
-        (
-            "✅ قرارداد اجرایی تازه ثبت شد.\n\n"
-            f"عنوان: {contract['title']}\n"
-            f"تعریف انجام‌شدن: {contract['done_definition']}\n"
-            f"مهلت: {contract['deadline']}\n"
-            f"نوع اثبات: {contract['proof_type']}\n"
-            f"نسخه اضطراری: {contract['micro_fallback']}\n"
-            f"اگر: {contract['if_then_trigger'] or 'ثبت نشده'}\n"
-            f"آنگاه: {contract['if_then_action'] or 'ثبت نشده'}\n"
-            f"کیفیت قرارداد: {validation['quality_score']} از ۱۰۰ ({status_label_fa(validation['validation_status'])})\n"
-            f"ریسک اجرا: {risk_label_fa(validation['predicted_risk'])}\n"
-            f"یادداشت: {validation['validation_notes']}"
-        )
-    )
-
-    with get_db() as conn:
+        schedule = safe_initialize_task_followup_schedule(conn, task)
+        # Fetch once after schedule update. If schedule creation failed, keep the contract
+        # and expose schedule_failed so the Mini App/operator sees the problem explicitly.
+        task = fetch_task_by_id(conn, new_task_id)
         lifecycle = build_task_lifecycle(conn, task)
+        task_dict = row_to_dict(task)
+        schedule_dict = task_schedule_from_row(task)
 
-    task_dict = row_to_dict(task)
+    if schedule_is_ready(schedule_dict):
+        send_bot_message_logged(
+            telegram_id,
+            contract_locked_message(task_dict, validation, schedule_dict),
+            task_dict["id"],
+            "contract_locked"
+        )
+
+    # Expose the execution-loop schedule explicitly so the Mini App can show when the bot will follow up.
+    task_with_schedule = dict(task_dict or {})
+    task_with_schedule.update(schedule_dict)
     return {
         "ok": True,
-        "task": task_dict,
-        "contract": task_dict,
+        "task": task_with_schedule,
+        "contract": task_with_schedule,
+        "schedule": schedule_dict,
+        "followup": followup_response_from_schedule(schedule_dict),
         "lifecycle": lifecycle
+    }
+
+
+@app.get("/bot/tick")
+def bot_tick(token: Optional[str] = None, limit: int = 25, x_bot_tick_token: Optional[str] = Header(None, alias="X-Bot-Tick-Token")):
+    validate_bot_tick_token(token, x_bot_tick_token)
+    return run_secure_cron_tick(source="legacy_tick_get", limit=max(1, min(int(limit or 25), 100)))
+
+
+@app.post("/bot/tick")
+def bot_tick_post(payload: Optional[Dict[str, Any]] = None, token: Optional[str] = None, x_bot_tick_token: Optional[str] = Header(None, alias="X-Bot-Tick-Token")):
+    payload = payload or {}
+    body_token = payload.get("token")
+    limit_value = int(payload.get("limit") or 25)
+    validate_bot_tick_token(body_token or token, x_bot_tick_token)
+    return run_secure_cron_tick(source="legacy_tick_post", limit=max(1, min(int(limit_value or 25), 100)))
+
+
+@app.get("/execution/followup/status")
+def execution_followup_status(telegram_id: str):
+    telegram_id = telegram_id.strip()
+    if not telegram_id:
+        raise HTTPException(status_code=400, detail="شناسه تلگرام الزامی است")
+    with get_db() as conn:
+        task = active_task_for_user(conn, telegram_id)
+        interaction = latest_open_interaction(conn, telegram_id)
+        logs = conn.execute(
+            """
+            SELECT id, task_id, kind, sent_at, ok, error
+            FROM bot_notifications_log
+            WHERE telegram_id = ?
+            ORDER BY id DESC
+            LIMIT 10
+            """,
+            (telegram_id,)
+        ).fetchall()
+    return {
+        "ok": True,
+        "version": B1_EXECUTION_LOOP_VERSION,
+        "task": row_to_dict(task),
+        "active_interaction": row_to_dict(interaction),
+        "notifications": [row_to_dict(row) for row in logs]
+    }
+
+
+@app.post("/execution/followup/backfill")
+def execution_followup_backfill(
+    token: Optional[str] = None,
+    limit: int = 100,
+    x_bot_tick_token: Optional[str] = Header(None, alias="X-Bot-Tick-Token")
+):
+    """Manual protected backfill for old active tasks without B1 schedule fields."""
+    validate_bot_tick_token(token, x_bot_tick_token)
+    with get_db() as conn:
+        count = backfill_missing_followup_schedules(conn, limit=max(1, min(int(limit or 100), 500)))
+    return {"ok": True, "backfilled": count, "version": B1_EXECUTION_LOOP_VERSION}
+
+
+@app.get("/execution/followup/due")
+def execution_followup_due(
+    token: Optional[str] = None,
+    limit: int = 20,
+    x_bot_tick_token: Optional[str] = Header(None, alias="X-Bot-Tick-Token")
+):
+    """Protected dry-run view of the execution-loop queue.
+
+    This does not send messages or mutate rows. Use it before wiring cron.
+    """
+    validate_bot_tick_token(token, x_bot_tick_token)
+    now = _iso(_utc_now())
+    limit = max(1, min(int(limit or 20), 100))
+    with get_db() as conn:
+        missing_schedule_rows = conn.execute(
+            """
+            SELECT id, telegram_id, title, deadline, created_at
+            FROM tasks
+            WHERE status = 'active'
+              AND (deadline_at IS NULL OR checkpoint_due_at IS NULL OR final_status IS NULL)
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (limit,)
+        ).fetchall()
+        checkpoint_rows = conn.execute(
+            """
+            SELECT id, telegram_id, title, checkpoint_due_at, deadline_at
+            FROM tasks
+            WHERE status = 'active'
+              AND checkpoint_due_at IS NOT NULL
+              AND checkpoint_sent_at IS NULL
+              AND checkpoint_due_at <= ?
+            ORDER BY checkpoint_due_at ASC
+            LIMIT ?
+            """,
+            (now, limit)
+        ).fetchall()
+        deadline_rows = conn.execute(
+            """
+            SELECT id, telegram_id, title, deadline_at
+            FROM tasks
+            WHERE status = 'active'
+              AND deadline_at IS NOT NULL
+              AND completed_at IS NULL
+              AND deadline_prompt_sent_at IS NULL
+              AND deadline_at <= ?
+            ORDER BY deadline_at ASC
+            LIMIT ?
+            """,
+            (now, limit)
+        ).fetchall()
+        recovery_rows = conn.execute(
+            """
+            SELECT id, telegram_id, title, follow_up_at
+            FROM tasks
+            WHERE status = 'active'
+              AND follow_up_at IS NOT NULL
+              AND follow_up_sent_at IS NULL
+              AND follow_up_at <= ?
+            ORDER BY follow_up_at ASC
+            LIMIT ?
+            """,
+            (now, limit)
+        ).fetchall()
+
+    return {
+        "ok": True,
+        "version": B1_EXECUTION_LOOP_VERSION,
+        "now": now,
+        "missing_schedule": [row_to_dict(row) for row in missing_schedule_rows],
+        "checkpoint_due": [row_to_dict(row) for row in checkpoint_rows],
+        "deadline_due": [row_to_dict(row) for row in deadline_rows],
+        "recovery_followup_due": [row_to_dict(row) for row in recovery_rows],
+        "counts": {
+            "missing_schedule": len(missing_schedule_rows),
+            "checkpoint_due": len(checkpoint_rows),
+            "deadline_due": len(deadline_rows),
+            "recovery_followup_due": len(recovery_rows)
+        }
+    }
+
+
+@app.get("/execution/followup/diagnostics")
+def execution_followup_diagnostics(
+    token: Optional[str] = None,
+    x_bot_tick_token: Optional[str] = Header(None, alias="X-Bot-Tick-Token")
+):
+    """Protected deploy-readiness snapshot for the B1 execution loop."""
+    validate_bot_tick_token(token, x_bot_tick_token)
+    now = _iso(_utc_now())
+    with get_db() as conn:
+        missing_schedule = conn.execute(
+            """
+            SELECT COUNT(*) AS count FROM tasks
+            WHERE status = 'active'
+              AND (deadline_at IS NULL OR checkpoint_due_at IS NULL OR final_status IS NULL)
+            """
+        ).fetchone()["count"]
+        due_checkpoint = conn.execute(
+            """
+            SELECT COUNT(*) AS count FROM tasks
+            WHERE status = 'active'
+              AND checkpoint_due_at IS NOT NULL
+              AND checkpoint_sent_at IS NULL
+              AND checkpoint_due_at <= ?
+            """,
+            (now,)
+        ).fetchone()["count"]
+        due_deadline = conn.execute(
+            """
+            SELECT COUNT(*) AS count FROM tasks
+            WHERE status = 'active'
+              AND deadline_at IS NOT NULL
+              AND completed_at IS NULL
+              AND deadline_prompt_sent_at IS NULL
+              AND deadline_at <= ?
+            """,
+            (now,)
+        ).fetchone()["count"]
+        open_interactions = conn.execute(
+            "SELECT COUNT(*) AS count FROM bot_interactions WHERE status = 'open'"
+        ).fetchone()["count"]
+        failed_notifications = conn.execute(
+            "SELECT COUNT(*) AS count FROM bot_notifications_log WHERE ok = 0"
+        ).fetchone()["count"]
+        cron_lock = row_to_dict(cron_lock_row(conn))
+        latest_cron_run = conn.execute(
+            """
+            SELECT id, run_id, source, status, started_at, finished_at, error
+            FROM bot_cron_runs
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+    return {
+        "ok": True,
+        "version": B1_EXECUTION_LOOP_VERSION,
+        "now": now,
+        "missing_schedule": missing_schedule,
+        "due_checkpoint": due_checkpoint,
+        "due_deadline": due_deadline,
+        "open_interactions": open_interactions,
+        "failed_notifications": failed_notifications,
+        "ready_for_cron": bool(BOT_CRON_TOKEN or BOT_TICK_TOKEN),
+        "bot_token_configured": bool(BOT_TOKEN),
+        "cron_lock": cron_lock,
+        "latest_cron_run": row_to_dict(latest_cron_run)
+    }
+
+
+@app.get("/bot/cron/tick")
+def bot_cron_tick(
+    token: Optional[str] = None,
+    limit: int = 25,
+    lock_seconds: Optional[int] = None,
+    source: str = "cron_get",
+    x_cron_token: Optional[str] = Header(None, alias="X-Cron-Token"),
+    x_bot_tick_token: Optional[str] = Header(None, alias="X-Bot-Tick-Token")
+):
+    """Secure cron-safe runner for /bot/tick with a DB-backed lock and run log."""
+    validate_bot_cron_token(token, x_cron_token or x_bot_tick_token)
+    return run_secure_cron_tick(source=source, limit=limit, lock_seconds=lock_seconds)
+
+
+@app.post("/bot/cron/tick")
+def bot_cron_tick_post(
+    payload: Optional[Dict[str, Any]] = None,
+    token: Optional[str] = None,
+    x_cron_token: Optional[str] = Header(None, alias="X-Cron-Token"),
+    x_bot_tick_token: Optional[str] = Header(None, alias="X-Bot-Tick-Token")
+):
+    """POST variant for external cron providers that send JSON bodies."""
+    payload = payload or {}
+    body_token = payload.get("token")
+    limit = int(payload.get("limit") or 25)
+    lock_seconds = payload.get("lock_seconds")
+    source = payload.get("source") or "cron_post"
+    validate_bot_cron_token(body_token or token, x_cron_token or x_bot_tick_token)
+    return run_secure_cron_tick(source=source, limit=limit, lock_seconds=lock_seconds)
+
+
+@app.get("/bot/cron/status")
+def bot_cron_status(
+    token: Optional[str] = None,
+    limit: int = 10,
+    x_cron_token: Optional[str] = Header(None, alias="X-Cron-Token"),
+    x_bot_tick_token: Optional[str] = Header(None, alias="X-Bot-Tick-Token")
+):
+    validate_bot_cron_token(token, x_cron_token or x_bot_tick_token)
+    with get_db() as conn:
+        lock = row_to_dict(cron_lock_row(conn))
+        runs = [row_to_dict(r) for r in cron_runs_snapshot(conn, limit=limit)]
+    return {
+        "ok": True,
+        "version": B1_EXECUTION_LOOP_VERSION,
+        "lock": lock,
+        "runs": runs,
+        "cron_token_configured": bool(BOT_CRON_TOKEN or BOT_TICK_TOKEN),
+        "bot_token_configured": bool(BOT_TOKEN)
     }
 
 
@@ -1945,7 +3326,7 @@ def get_today(telegram_id: str):
                 (telegram_id,)
             ).fetchone()
 
-        if task is None:
+        if task is None and AUTO_SEED_DEFAULT_TASK:
             created = now_iso()
             cursor = conn.execute(
                 """
@@ -1984,15 +3365,41 @@ def get_today(telegram_id: str):
                 "SELECT * FROM tasks WHERE id = ?",
                 (task_id,)
             ).fetchone()
+            safe_initialize_task_followup_schedule(conn, task)
+            task = conn.execute(
+                "SELECT * FROM tasks WHERE id = ?",
+                (task_id,)
+            ).fetchone()
+        elif task is None:
+            lifecycle = build_task_lifecycle(conn, None)
+            schedule = task_schedule_from_row(None)
+            return {
+                "ok": True,
+                "task": None,
+                "contract": None,
+                "schedule": schedule,
+                "lifecycle": lifecycle
+            }
+        elif task is not None:
+            # Backfill schedule for older active contracts created before B1/B1C.
+            ensure_task_followup_schedule(conn, task)
+            task = conn.execute(
+                "SELECT * FROM tasks WHERE id = ?",
+                (task["id"],)
+            ).fetchone()
 
-    with get_db() as conn:
         lifecycle = build_task_lifecycle(conn, task)
+        schedule = task_schedule_from_row(task)
 
     task_dict = row_to_dict(task)
+    task_with_schedule = dict(task_dict or {})
+    task_with_schedule.update(schedule)
     return {
         "ok": True,
-        "task": task_dict,
-        "contract": task_dict,
+        "task": task_with_schedule,
+        "contract": task_with_schedule,
+        "schedule": schedule,
+        "followup": followup_response_from_schedule(schedule),
         "lifecycle": lifecycle
     }
 
@@ -2111,6 +3518,7 @@ def create_proof(data: ProofCreateRequest):
                 "xp_awarded": 0,
                 "detected_links": 0,
                 "word_count": count_words_loose(proof_text),
+                "streak_delta": 0,
             }
 
             conn.execute(
@@ -2142,8 +3550,6 @@ def create_proof(data: ProofCreateRequest):
                     now_iso()
                 )
             )
-
-            conn.commit()
 
             proof = None
 
@@ -2197,11 +3603,14 @@ def create_proof(data: ProofCreateRequest):
             )
 
             if needs_review:
+                proof_validation["streak_delta"] = 0
                 conn.execute(
                     """
                     UPDATE tasks
                     SET status = 'under_review',
                         lifecycle_status = 'under_review',
+                        final_status = 'under_review',
+                        current_interaction_id = NULL,
                         submitted_at = ?,
                         proof_attempts_count = proof_attempts_count + 1,
                         integrity_status = 'pending_review',
@@ -2230,8 +3639,6 @@ def create_proof(data: ProofCreateRequest):
                     )
                 )
 
-                conn.commit()
-
                 proof = conn.execute(
                     "SELECT * FROM proofs WHERE id = ?",
                     (cursor.lastrowid,)
@@ -2244,7 +3651,12 @@ def create_proof(data: ProofCreateRequest):
 
             else:
                 new_xp = int(user["xp"]) + xp_awarded
-                new_streak = int(user["streak_days"]) + 1
+                # B1B: XP and verified proof count can grow with each accepted proof,
+                # but streak should increase at most once per UTC date.
+                prior_accepted_today = accepted_streak_already_recorded_today(conn, telegram_id, exclude_proof_id=cursor.lastrowid)
+                streak_delta = 0 if prior_accepted_today else 1
+                proof_validation["streak_delta"] = streak_delta
+                new_streak = int(user["streak_days"]) + streak_delta
                 new_verified_count = int(user["verified_proofs_count"]) + 1
                 new_stage = calculate_stage(new_streak, new_verified_count)
 
@@ -2270,6 +3682,8 @@ def create_proof(data: ProofCreateRequest):
                     UPDATE tasks
                     SET status = 'completed',
                         lifecycle_status = 'completed',
+                        final_status = 'completed',
+                        current_interaction_id = NULL,
                         submitted_at = ?,
                         completed_at = ?,
                         proof_attempts_count = proof_attempts_count + 1,
@@ -2294,12 +3708,10 @@ def create_proof(data: ProofCreateRequest):
                         xp_awarded,
                         old_stage,
                         new_stage,
-                        f"task_id={data.task_id};review_status={proof_validation['review_status']};proof_score={proof_validation['proof_quality_score']}",
+                        f"task_id={data.task_id};review_status={proof_validation['review_status']};proof_score={proof_validation['proof_quality_score']};streak_delta={streak_delta}",
                         now_iso()
                     )
                 )
-
-                conn.commit()
 
                 proof = conn.execute(
                     "SELECT * FROM proofs WHERE id = ?",
@@ -2348,6 +3760,11 @@ def create_proof(data: ProofCreateRequest):
         "message": "ثبت نشد؛ ثبت تکراری معتبر نیست." if is_duplicate else "اثبات قرارداد ثبت شد.",
         "proof": row_to_dict(proof),
         "proof_validation": proof_validation,
+        "progress_delta": {
+            "xp_awarded": proof_validation.get("xp_awarded", 0),
+            "streak_delta": proof_validation.get("streak_delta", 0),
+            "review_status": proof_validation.get("review_status")
+        },
         "user": row_to_dict(updated_user),
         "contract": row_to_dict(refreshed_task),
         "lifecycle": lifecycle
@@ -3400,7 +4817,12 @@ def review_queue(limit: int = 20):
 
 
 @app.post("/review/decision")
-def review_decision(data: ReviewDecisionRequest):
+def review_decision(
+    data: ReviewDecisionRequest,
+    token: Optional[str] = None,
+    x_bot_tick_token: Optional[str] = Header(None, alias="X-Bot-Tick-Token")
+):
+    validate_bot_tick_token(token, x_bot_tick_token)
     decision = data.decision.strip().lower()
     if decision not in {"accepted", "rejected", "needs_revision"}:
         raise HTTPException(status_code=400, detail="تصمیم review نامعتبر است")
@@ -3661,7 +5083,12 @@ def appeals_queue(limit: int = 20):
 
 
 @app.post("/appeals/resolve")
-def resolve_appeal(data: AppealResolveRequest):
+def resolve_appeal(
+    data: AppealResolveRequest,
+    token: Optional[str] = None,
+    x_bot_tick_token: Optional[str] = Header(None, alias="X-Bot-Tick-Token")
+):
+    validate_bot_tick_token(token, x_bot_tick_token)
     decision = data.decision.strip().lower()
     if decision not in {"accepted", "denied"}:
         raise HTTPException(status_code=400, detail="تصمیم اعتراض نامعتبر است")
@@ -3853,7 +5280,8 @@ def latest_proof_validation(telegram_id: str):
 
 
 @app.get("/debug/state")
-def debug_state():
+def debug_state(token: Optional[str] = None, x_bot_tick_token: Optional[str] = Header(None, alias="X-Bot-Tick-Token")):
+    validate_bot_tick_token(token, x_bot_tick_token)
     with get_db() as conn:
         users = [row_to_dict(r) for r in conn.execute("SELECT * FROM users ORDER BY created_at DESC").fetchall()]
         tasks = [row_to_dict(r) for r in conn.execute("SELECT * FROM tasks ORDER BY id DESC").fetchall()]
