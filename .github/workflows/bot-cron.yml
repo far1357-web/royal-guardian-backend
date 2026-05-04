@@ -1,0 +1,29 @@
+name: Royal Guardian Bot Cron
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: royal-guardian-bot-cron
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Call backend cron tick
+        run: |
+          python - <<'PY'
+          import os
+          import urllib.request
+
+          backend_url = "https://royal-guardian-backend.onrender.com"
+          token = os.environ["BOT_CRON_TOKEN"]
+          url = backend_url + "/bot/cron/tick?token=" + token + "&source=github_actions"
+          print(urllib.request.urlopen(url, timeout=30).read().decode())
+          PY
+        env:
+          BOT_CRON_TOKEN: ${{ secrets.BOT_CRON_TOKEN }}
