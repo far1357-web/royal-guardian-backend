@@ -32,10 +32,13 @@ REVIEW_APPEAL_VERSION = "v36c-review-appeal-lite-1"
 DASHBOARD_TIMELINE_VERSION = "v36c-dashboard-timeline-lite-1"
 TEAM_WITNESS_VERSION = "v36c-team-witness-lite-1"
 BOT_COMMAND_VERSION = "v36c-bot-command-center-lite-1"
-B1_EXECUTION_LOOP_VERSION = "b1m-webhook-lock-security-fixes-v1"
+B1_EXECUTION_LOOP_VERSION = "b1o-deploy-gates-v1"
 BOT_TICK_TOKEN = os.getenv("BOT_TICK_TOKEN", "").strip()
 BOT_CRON_TOKEN = os.getenv("BOT_CRON_TOKEN", "").strip()
 BOT_CRON_LOCK_SECONDS = int(os.getenv("BOT_CRON_LOCK_SECONDS", "120") or "120")
+CRON_EXPECTED_EVERY_MINUTES = int(os.getenv("CRON_EXPECTED_EVERY_MINUTES", "5") or "5")
+WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "https://royal-guardian-backend.onrender.com").strip().rstrip("/")
+PUBLIC_LAUNCH_REQUIRE_POSTGRES = os.getenv("PUBLIC_LAUNCH_REQUIRE_POSTGRES", "1").strip().lower() not in {"0", "false", "no", "off"}
 BOT_TICK_ALLOW_DEV_NO_TOKEN = os.getenv("BOT_TICK_ALLOW_DEV_NO_TOKEN", "").strip().lower() in {"1", "true", "yes", "on"}
 AUTO_SEED_DEFAULT_TASK = os.getenv("AUTO_SEED_DEFAULT_TASK", "").strip().lower() in {"1", "true", "yes", "on"}
 # Telegram sends this header only if setWebhook(secret_token=...) was configured.
@@ -74,7 +77,7 @@ AMBIGUOUS_PREFIXES = (
 
 app = FastAPI(
     title="Royal Guardian Backend",
-    version="0.14.9-b1m-webhook-lock-security-fixes-v1"
+    version="0.15.1-b1o-deploy-gates-v1"
 )
 
 app.add_middleware(
@@ -1536,9 +1539,9 @@ def create_base_tables_postgres(conn) -> None:
             telegram_id TEXT PRIMARY KEY,
             first_name TEXT NOT NULL,
             username TEXT,
-            xp INTEGER NOT NULL DEFAULT 240,
-            streak_days INTEGER NOT NULL DEFAULT 5,
-            guardian_stage TEXT NOT NULL DEFAULT 'شکاف طلایی',
+            xp INTEGER NOT NULL DEFAULT 0,
+            streak_days INTEGER NOT NULL DEFAULT 0,
+            guardian_stage TEXT NOT NULL DEFAULT 'هسته خاموش',
             verified_proofs_count INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -1644,9 +1647,9 @@ def create_base_tables_sqlite(conn) -> None:
             telegram_id TEXT PRIMARY KEY,
             first_name TEXT NOT NULL,
             username TEXT,
-            xp INTEGER NOT NULL DEFAULT 240,
-            streak_days INTEGER NOT NULL DEFAULT 5,
-            guardian_stage TEXT NOT NULL DEFAULT 'شکاف طلایی',
+            xp INTEGER NOT NULL DEFAULT 0,
+            streak_days INTEGER NOT NULL DEFAULT 0,
+            guardian_stage TEXT NOT NULL DEFAULT 'هسته خاموش',
             verified_proofs_count INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -2035,7 +2038,7 @@ def root():
         "database": DB_PATH,
         "db_backend": DB_BACKEND,
         "database_url_configured": bool(DATABASE_URL),
-        "version": "0.14.9-b1m-webhook-lock-security-fixes-v1"
+        "version": "0.15.1-b1o-deploy-gates-v1"
     }
 
 
@@ -2048,7 +2051,7 @@ def health():
         "db_backend": DB_BACKEND,
         "database_url_configured": bool(DATABASE_URL),
         "bot_token_configured": bool(BOT_TOKEN),
-        "version": "0.14.9-b1m-webhook-lock-security-fixes-v1"
+        "version": "0.15.1-b1o-deploy-gates-v1"
     }
 
 
@@ -2463,7 +2466,7 @@ def handle_bot_command(chat_id: str, command: str, first_name: str = "کاربر
 def features():
     return {
         "ok": True,
-        "version": "0.14.9-b1m-webhook-lock-security-fixes-v1",
+        "version": "0.15.1-b1o-deploy-gates-v1",
         "bot_command_version": BOT_COMMAND_VERSION,
         "features": [
             "contract_core",
@@ -2516,7 +2519,7 @@ def bot_set_webhook(
     if not BOT_TOKEN:
         raise HTTPException(status_code=503, detail="BOT_TOKEN تنظیم نشده است")
 
-    webhook_url = (url or "https://royal-guardian-backend.onrender.com/bot/webhook").strip()
+    webhook_url = (url or f"{WEBHOOK_BASE_URL}/bot/webhook").strip()
     payload = {
         "url": webhook_url,
         "allowed_updates": ["message", "callback_query"]
@@ -2881,6 +2884,179 @@ def cron_runs_snapshot(conn, limit: int = 10):
     ).fetchall()
 
 
+def parse_runtime_datetime(value) -> Optional[datetime]:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    raw = str(value).strip()
+    if not raw:
+        return None
+    raw = raw.replace("Z", "")
+    if "+" in raw:
+        raw = raw.split("+", 1)[0]
+    raw = raw.replace(" UTC", "").strip()
+    if " " in raw and "T" not in raw:
+        raw = raw.replace(" ", "T", 1)
+    try:
+        return datetime.fromisoformat(raw)
+    except Exception:
+        return None
+
+
+def minutes_since(value) -> Optional[int]:
+    parsed = parse_runtime_datetime(value)
+    if not parsed:
+        return None
+    return int((_utc_now() - parsed).total_seconds() // 60)
+
+
+def latest_cron_run_row(conn):
+    return conn.execute(
+        """
+        SELECT id, run_id, source, status, started_at, finished_at, processed_json, error
+        FROM bot_cron_runs
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+
+
+def cron_freshness_status(latest_run) -> Dict[str, Any]:
+    row = row_to_dict(latest_run)
+    if not row:
+        return {
+            "configured": bool(BOT_CRON_TOKEN or BOT_TICK_TOKEN),
+            "latest_run": None,
+            "minutes_since_latest": None,
+            "expected_every_minutes": CRON_EXPECTED_EVERY_MINUTES,
+            "fresh": False,
+            "status": "no_runs_yet",
+        }
+    minutes = minutes_since(row.get("finished_at") or row.get("started_at"))
+    allowed = max(10, CRON_EXPECTED_EVERY_MINUTES * 3)
+    return {
+        "configured": bool(BOT_CRON_TOKEN or BOT_TICK_TOKEN),
+        "latest_run": row,
+        "minutes_since_latest": minutes,
+        "expected_every_minutes": CRON_EXPECTED_EVERY_MINUTES,
+        "fresh": minutes is not None and minutes <= allowed and row.get("status") == "completed",
+        "status": "fresh" if minutes is not None and minutes <= allowed and row.get("status") == "completed" else "stale_or_failed",
+    }
+
+
+def readiness_score(checks):
+    total = len(checks)
+    passed = sum(1 for item in checks if item.get("ok"))
+    return {
+        "passed": passed,
+        "total": total,
+        "percent": int(round((passed / total) * 100)) if total else 0,
+    }
+
+
+def env_readiness_report(mode: str = "three_user") -> Dict[str, Any]:
+    mode = (mode or "three_user").strip().lower()
+    public_mode = mode in {"public", "launch", "public_launch"}
+    items = [
+        {"key": "BOT_TOKEN", "required": True, "configured": bool(BOT_TOKEN), "purpose": "Telegram Bot API پیام reminder را می‌فرستد."},
+        {"key": "BOT_TICK_TOKEN", "required": True, "configured": bool(BOT_TICK_TOKEN), "purpose": "محافظت endpointهای عملیاتی backend."},
+        {"key": "BOT_CRON_TOKEN", "required": True, "configured": bool(BOT_CRON_TOKEN), "purpose": "محافظت اجرای cron."},
+        {"key": "TELEGRAM_WEBHOOK_SECRET_TOKEN", "required": True, "configured": bool(TELEGRAM_WEBHOOK_SECRET_TOKEN), "purpose": "محافظت webhook تلگرام."},
+        {"key": "DATABASE_URL", "required": public_mode, "configured": bool(DATABASE_URL), "purpose": "Postgres برای launch عمومی لازم است؛ برای تست ۳ نفره SQLite قابل قبول است."},
+        {"key": "WEBHOOK_BASE_URL", "required": False, "configured": bool(WEBHOOK_BASE_URL), "purpose": "ساخت URL پیش‌فرض /bot/webhook."},
+    ]
+    missing_required = [item["key"] for item in items if item["required"] and not item["configured"]]
+    warnings = []
+    if not DATABASE_URL:
+        warnings.append("SQLite فقط برای local یا تست کوچک قابل قبول است؛ برای public launch باید DATABASE_URL/Postgres فعال باشد.")
+    if AUTO_SEED_DEFAULT_TASK:
+        warnings.append("AUTO_SEED_DEFAULT_TASK روشن است؛ برای تست واقعی باید خاموش باشد تا task fake ساخته نشود.")
+    if BOT_TICK_ALLOW_DEV_NO_TOKEN:
+        warnings.append("BOT_TICK_ALLOW_DEV_NO_TOKEN روشن است؛ این فقط برای dev/SQLite است و نباید در production فعال باشد.")
+    return {
+        "mode": "public_launch" if public_mode else "three_user",
+        "items": items,
+        "missing_required": missing_required,
+        "warnings": warnings,
+        "ok_for_three_user": not [i for i in items[:4] if i["required"] and not i["configured"]],
+        "ok_for_public_launch": not missing_required and bool(DATABASE_URL) and not AUTO_SEED_DEFAULT_TASK and not BOT_TICK_ALLOW_DEV_NO_TOKEN,
+    }
+
+
+def proof_policy_report() -> Dict[str, Any]:
+    return {
+        "scope": "lite_mvp",
+        "engine": PROOF_CORE_VERSION,
+        "ok_for_three_user_test": True,
+        "ok_for_public_launch": False,
+        "implemented": [
+            "minimum proof length/word checks",
+            "link detection",
+            "duplicate proof blocking",
+            "risk and score",
+            "needs_review path",
+            "token-protected review/appeal endpoints",
+        ],
+        "parked": [
+            "full V36C anti-cheat",
+            "human review operations UI",
+            "witness-attested proof",
+            "team/social pressure integration",
+        ],
+        "decision": "برای تست ۳ نفره کافی است؛ برای public launch کافی نیست."
+    }
+
+
+def feature_scope_report() -> Dict[str, Any]:
+    return {
+        "core_loop_required_for_three_user": [
+            "contract creation",
+            "followup schedule",
+            "cron tick",
+            "Telegram checkpoint/deadline",
+            "done/miss/snooze/recovery reply routing",
+            "proof submission",
+            "progress/history sync",
+        ],
+        "parked_until_after_three_user_test": [
+            "witness frontend",
+            "team frontend",
+            "leaderboard frontend",
+            "full V36C anti-cheat",
+            "public launch monitoring/backup policy",
+        ],
+        "reason": "تست ۳ نفره باید اول core execution loop را ثابت کند؛ featureهای اجتماعی بعد از آن ارزش دارند."
+    }
+
+
+def deployment_gate_report(mode: str, *, cron_freshness: Dict[str, Any], missing_schedule: int, failed_notifications: int) -> Dict[str, Any]:
+    env = env_readiness_report(mode)
+    proof = proof_policy_report()
+    public_mode = env["mode"] == "public_launch"
+    checks = [
+        {"key": "env", "label": "Environmentهای ضروری", "ok": (env["ok_for_public_launch"] if public_mode else env["ok_for_three_user"]), "detail": env["missing_required"]},
+        {"key": "db", "label": "Database mode", "ok": bool(DATABASE_URL) if public_mode else True, "detail": DB_BACKEND},
+        {"key": "cron_configured", "label": "Cron token configured", "ok": bool(BOT_CRON_TOKEN or BOT_TICK_TOKEN), "detail": bool(BOT_CRON_TOKEN or BOT_TICK_TOKEN)},
+        {"key": "cron_operational", "label": "Cron has run or is ready", "ok": cron_freshness.get("fresh") or cron_freshness.get("status") == "no_runs_yet", "detail": cron_freshness.get("status")},
+        {"key": "schedule", "label": "No active task missing schedule", "ok": missing_schedule == 0, "detail": missing_schedule},
+        {"key": "notifications", "label": "No failed notification backlog", "ok": failed_notifications == 0 or not public_mode, "detail": failed_notifications},
+        {"key": "proof_policy", "label": "Proof policy acceptable", "ok": proof["ok_for_public_launch"] if public_mode else proof["ok_for_three_user_test"], "detail": proof["scope"]},
+    ]
+    score = readiness_score(checks)
+    blockers = [c for c in checks if not c["ok"]]
+    return {
+        "mode": env["mode"],
+        "ready": not blockers,
+        "score": score,
+        "checks": checks,
+        "blockers": blockers,
+        "env": env,
+        "proof_policy": proof,
+        "feature_scope": feature_scope_report(),
+    }
+
+
 def run_secure_cron_tick(*, source: str = "cron", limit: int = 25, lock_seconds: int = None) -> Dict[str, Any]:
     with get_db() as conn:
         lock = acquire_cron_lock(conn, source=source, lock_seconds=lock_seconds)
@@ -3198,14 +3374,8 @@ def execution_followup_diagnostics(
             "SELECT COUNT(*) AS count FROM bot_notifications_log WHERE ok = 0"
         ).fetchone()["count"]
         cron_lock = row_to_dict(cron_lock_row(conn))
-        latest_cron_run = conn.execute(
-            """
-            SELECT id, run_id, source, status, started_at, finished_at, error
-            FROM bot_cron_runs
-            ORDER BY id DESC
-            LIMIT 1
-            """
-        ).fetchone()
+        latest_cron_run = latest_cron_run_row(conn)
+        cron_freshness = cron_freshness_status(latest_cron_run)
 
     return {
         "ok": True,
@@ -3219,7 +3389,8 @@ def execution_followup_diagnostics(
         "ready_for_cron": bool(BOT_CRON_TOKEN or BOT_TICK_TOKEN),
         "bot_token_configured": bool(BOT_TOKEN),
         "cron_lock": cron_lock,
-        "latest_cron_run": row_to_dict(latest_cron_run)
+        "latest_cron_run": row_to_dict(latest_cron_run),
+        "cron_freshness": cron_freshness
     }
 
 
@@ -3264,14 +3435,205 @@ def bot_cron_status(
     validate_bot_cron_token(token, x_cron_token or x_bot_tick_token)
     with get_db() as conn:
         lock = row_to_dict(cron_lock_row(conn))
-        runs = [row_to_dict(r) for r in cron_runs_snapshot(conn, limit=limit)]
+        run_rows = cron_runs_snapshot(conn, limit=limit)
+        runs = [row_to_dict(r) for r in run_rows]
+        latest = run_rows[0] if run_rows else None
+        freshness = cron_freshness_status(latest)
     return {
         "ok": True,
         "version": B1_EXECUTION_LOOP_VERSION,
         "lock": lock,
         "runs": runs,
+        "freshness": freshness,
         "cron_token_configured": bool(BOT_CRON_TOKEN or BOT_TICK_TOKEN),
         "bot_token_configured": bool(BOT_TOKEN)
+    }
+
+
+@app.get("/ops/preflight")
+def ops_preflight(
+    token: Optional[str] = None,
+    mode: str = "three_user",
+    x_bot_tick_token: Optional[str] = Header(None, alias="X-Bot-Tick-Token")
+):
+    """Protected pre-test readiness check for B1N.
+
+    This does not mutate data. Use it before 3-user testing.
+    """
+    validate_bot_tick_token(token, x_bot_tick_token)
+    now = _iso(_utc_now())
+    with get_db() as conn:
+        latest = latest_cron_run_row(conn)
+        cron_freshness = cron_freshness_status(latest)
+        missing_schedule = conn.execute(
+            """
+            SELECT COUNT(*) AS count FROM tasks
+            WHERE status = 'active'
+              AND (deadline_at IS NULL OR checkpoint_due_at IS NULL OR final_status IS NULL)
+            """
+        ).fetchone()["count"]
+        open_interactions = conn.execute(
+            "SELECT COUNT(*) AS count FROM bot_interactions WHERE status = 'open'"
+        ).fetchone()["count"]
+        failed_notifications = conn.execute(
+            "SELECT COUNT(*) AS count FROM bot_notifications_log WHERE ok = 0"
+        ).fetchone()["count"]
+        users_count = conn.execute("SELECT COUNT(*) AS count FROM users").fetchone()["count"]
+
+    checks = [
+        {"key": "postgres", "label": "Postgres فعال است", "ok": DB_BACKEND == "postgres", "value": DB_BACKEND},
+        {"key": "bot_token", "label": "BOT_TOKEN تنظیم شده", "ok": bool(BOT_TOKEN), "value": bool(BOT_TOKEN)},
+        {"key": "tick_token", "label": "BOT_TICK_TOKEN تنظیم شده", "ok": bool(BOT_TICK_TOKEN), "value": bool(BOT_TICK_TOKEN)},
+        {"key": "cron_token", "label": "BOT_CRON_TOKEN یا fallback تنظیم شده", "ok": bool(BOT_CRON_TOKEN or BOT_TICK_TOKEN), "value": bool(BOT_CRON_TOKEN or BOT_TICK_TOKEN)},
+        {"key": "webhook_secret", "label": "Telegram webhook secret تنظیم شده", "ok": bool(TELEGRAM_WEBHOOK_SECRET_TOKEN), "value": bool(TELEGRAM_WEBHOOK_SECRET_TOKEN)},
+        {"key": "cron_recent", "label": "Cron اخیراً اجرا شده", "ok": cron_freshness.get("fresh") or cron_freshness.get("status") == "no_runs_yet", "value": cron_freshness.get("status")},
+        {"key": "missing_schedule", "label": "هیچ قرارداد فعالی بدون schedule نیست", "ok": missing_schedule == 0, "value": missing_schedule},
+        {"key": "cors", "label": "CORS محدود است", "ok": "*" not in CORS_ALLOW_ORIGINS, "value": CORS_ALLOW_ORIGINS},
+        {"key": "autoseed_off", "label": "AUTO_SEED_DEFAULT_TASK خاموش است", "ok": not AUTO_SEED_DEFAULT_TASK, "value": AUTO_SEED_DEFAULT_TASK},
+    ]
+    score = readiness_score(checks)
+    gate = deployment_gate_report(mode, cron_freshness=cron_freshness, missing_schedule=missing_schedule, failed_notifications=failed_notifications)
+
+    return {
+        "ok": True,
+        "version": B1_EXECUTION_LOOP_VERSION,
+        "time": now,
+        "score": score,
+        "checks": checks,
+        "deployment_gate": gate,
+        "env_readiness": gate["env"],
+        "proof_policy": gate["proof_policy"],
+        "feature_scope": gate["feature_scope"],
+        "cron": cron_freshness,
+        "counts": {
+            "users": users_count,
+            "missing_schedule": missing_schedule,
+            "open_interactions": open_interactions,
+            "failed_notifications": failed_notifications,
+        },
+        "render_cron": {
+            "recommended_interval_minutes": CRON_EXPECTED_EVERY_MINUTES,
+            "url": f"{WEBHOOK_BASE_URL}/bot/cron/tick?token=<BOT_CRON_TOKEN>&source=render_cron",
+            "command": "python -c \"import os, urllib.request; url=os.environ['BACKEND_URL'] + '/bot/cron/tick?token=' + os.environ['BOT_CRON_TOKEN'] + '&source=render_cron'; print(urllib.request.urlopen(url, timeout=30).read().decode())\""
+        },
+        "parked_for_after_3_user_test": gate["feature_scope"]["parked_until_after_three_user_test"]
+    }
+
+
+@app.get("/ops/deploy-gate")
+def ops_deploy_gate(
+    token: Optional[str] = None,
+    mode: str = "three_user",
+    x_bot_tick_token: Optional[str] = Header(None, alias="X-Bot-Tick-Token")
+):
+    """Protected deployment gate for three-user test vs public launch."""
+    validate_bot_tick_token(token, x_bot_tick_token)
+    now = _iso(_utc_now())
+    with get_db() as conn:
+        latest = latest_cron_run_row(conn)
+        cron_freshness = cron_freshness_status(latest)
+        missing_schedule = conn.execute(
+            """
+            SELECT COUNT(*) AS count FROM tasks
+            WHERE status = 'active'
+              AND (deadline_at IS NULL OR checkpoint_due_at IS NULL OR final_status IS NULL)
+            """
+        ).fetchone()["count"]
+        failed_notifications = conn.execute(
+            "SELECT COUNT(*) AS count FROM bot_notifications_log WHERE ok = 0"
+        ).fetchone()["count"]
+
+    gate = deployment_gate_report(mode, cron_freshness=cron_freshness, missing_schedule=missing_schedule, failed_notifications=failed_notifications)
+    return {
+        "ok": True,
+        "version": B1_EXECUTION_LOOP_VERSION,
+        "time": now,
+        "deployment_gate": gate,
+    }
+
+
+@app.get("/ops/three-user-readiness")
+def ops_three_user_readiness(
+    telegram_ids: str,
+    token: Optional[str] = None,
+    x_bot_tick_token: Optional[str] = Header(None, alias="X-Bot-Tick-Token")
+):
+    """Protected readiness snapshot for three real Telegram users.
+
+    Pass comma-separated IDs: ?telegram_ids=111,222,333
+    """
+    validate_bot_tick_token(token, x_bot_tick_token)
+    ids = [x.strip() for x in str(telegram_ids or "").split(",") if x.strip()]
+    if len(ids) != 3:
+        raise HTTPException(status_code=400, detail="دقیقاً سه telegram_id جدا با کاما بده")
+    if len(set(ids)) != 3:
+        raise HTTPException(status_code=400, detail="telegram_idها باید سه کاربر جدا باشند")
+
+    users = []
+    with get_db() as conn:
+        for telegram_id in ids:
+            user = conn.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)).fetchone()
+            active_task = conn.execute(
+                "SELECT * FROM tasks WHERE telegram_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1",
+                (telegram_id,)
+            ).fetchone()
+            task_count = conn.execute("SELECT COUNT(*) AS count FROM tasks WHERE telegram_id = ?", (telegram_id,)).fetchone()["count"]
+            proof_count = conn.execute("SELECT COUNT(*) AS count FROM proofs WHERE telegram_id = ?", (telegram_id,)).fetchone()["count"]
+            open_interaction = latest_open_interaction(conn, telegram_id)
+            notifications = conn.execute(
+                "SELECT COUNT(*) AS count FROM bot_notifications_log WHERE telegram_id = ?",
+                (telegram_id,)
+            ).fetchone()["count"]
+            users.append({
+                "telegram_id": telegram_id,
+                "user_exists": user is not None,
+                "progress": {
+                    "xp": user["xp"] if user else 0,
+                    "streak_days": user["streak_days"] if user else 0,
+                    "guardian_stage": user["guardian_stage"] if user else "—",
+                    "verified_proofs_count": user["verified_proofs_count"] if user else 0,
+                },
+                "active_task": row_to_dict(active_task),
+                "task_count": task_count,
+                "proof_count": proof_count,
+                "open_interaction": row_to_dict(open_interaction),
+                "notification_count": notifications,
+                "ready_for_individual_test": bool(user) and task_count >= 0,
+            })
+
+    return {
+        "ok": True,
+        "version": B1_EXECUTION_LOOP_VERSION,
+        "users": users,
+        "checks": {
+            "three_distinct_ids": True,
+            "postgres": DB_BACKEND == "postgres",
+            "bot_token_configured": bool(BOT_TOKEN),
+            "cron_token_configured": bool(BOT_CRON_TOKEN or BOT_TICK_TOKEN),
+        },
+        "next_test_flow": [
+            "برای هر کاربر /start در Telegram",
+            "برای هر کاربر یک contract با +3min بساز",
+            "/bot/cron/tick را اجرا کن یا منتظر Render Cron بمان",
+            "هر کاربر done بزند و proof بفرستد",
+            "برای هر کاربر /me/progress و history را جدا چک کن"
+        ]
+    }
+
+
+@app.get("/ops/proof-policy")
+def ops_proof_policy(
+    token: Optional[str] = None,
+    x_bot_tick_token: Optional[str] = Header(None, alias="X-Bot-Tick-Token")
+):
+    """Protected explanation of current proof/review scope for tester expectations."""
+    validate_bot_tick_token(token, x_bot_tick_token)
+    policy = proof_policy_report()
+    return {
+        "ok": True,
+        "version": B1_EXECUTION_LOOP_VERSION,
+        "proof_engine": PROOF_CORE_VERSION,
+        **policy,
     }
 
 
