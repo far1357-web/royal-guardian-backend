@@ -32,13 +32,15 @@ REVIEW_APPEAL_VERSION = "v36c-review-appeal-lite-1"
 DASHBOARD_TIMELINE_VERSION = "v36c-dashboard-timeline-lite-1"
 TEAM_WITNESS_VERSION = "v36c-team-witness-lite-1"
 BOT_COMMAND_VERSION = "v36c-bot-command-center-lite-1"
-B1_EXECUTION_LOOP_VERSION = "b1o-deploy-gates-v1"
+B1_EXECUTION_LOOP_VERSION = "b2-contract-lifecycle-v1"
 BOT_TICK_TOKEN = os.getenv("BOT_TICK_TOKEN", "").strip()
 BOT_CRON_TOKEN = os.getenv("BOT_CRON_TOKEN", "").strip()
 BOT_CRON_LOCK_SECONDS = int(os.getenv("BOT_CRON_LOCK_SECONDS", "120") or "120")
 CRON_EXPECTED_EVERY_MINUTES = int(os.getenv("CRON_EXPECTED_EVERY_MINUTES", "5") or "5")
 WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "https://royal-guardian-backend.onrender.com").strip().rstrip("/")
 PUBLIC_LAUNCH_REQUIRE_POSTGRES = os.getenv("PUBLIC_LAUNCH_REQUIRE_POSTGRES", "1").strip().lower() not in {"0", "false", "no", "off"}
+DAILY_SUCCESS_XP = int(os.getenv("DAILY_SUCCESS_XP", "5") or "5")
+AUTO_MISS_GRACE_MINUTES = int(os.getenv("AUTO_MISS_GRACE_MINUTES", "60") or "60")
 BOT_TICK_ALLOW_DEV_NO_TOKEN = os.getenv("BOT_TICK_ALLOW_DEV_NO_TOKEN", "").strip().lower() in {"1", "true", "yes", "on"}
 AUTO_SEED_DEFAULT_TASK = os.getenv("AUTO_SEED_DEFAULT_TASK", "").strip().lower() in {"1", "true", "yes", "on"}
 # Telegram sends this header only if setWebhook(secret_token=...) was configured.
@@ -77,7 +79,7 @@ AMBIGUOUS_PREFIXES = (
 
 app = FastAPI(
     title="Royal Guardian Backend",
-    version="0.15.1-b1o-deploy-gates-v1"
+    version="0.16.1-b2a-contract-lifecycle-fixes-v1"
 )
 
 app.add_middleware(
@@ -218,18 +220,38 @@ def send_bot_message(chat_id: str, text: str) -> bool:
         return False
 
 
-def calculate_stage(streak_days: int, verified_proofs_count: int) -> str:
-    if streak_days >= 60:
-        return "نگهبان سلطنتی"
-    if streak_days >= 30:
-        return "شیر طلایی"
-    if streak_days >= 14:
-        return "شیر جوان"
-    if streak_days >= 7:
-        return "نگهبان بیدار"
-    if verified_proofs_count >= 1 or streak_days >= 3:
-        return "شکاف طلایی"
-    return "هسته خاموش"
+def rank_for_xp(xp: int) -> Dict[str, Any]:
+    xp = max(0, int(xp or 0))
+    ranks = [
+        {"name": "نگهبان", "threshold": 0},
+        {"name": "سرباز", "threshold": 300},
+        {"name": "فرمانده", "threshold": 1200},
+        {"name": "سپهبد", "threshold": 3600},
+    ]
+    current = ranks[0]
+    next_rank = None
+    for idx, rank in enumerate(ranks):
+        if xp >= rank["threshold"]:
+            current = rank
+            next_rank = ranks[idx + 1] if idx + 1 < len(ranks) else None
+    return {
+        "rank": current["name"],
+        "threshold": current["threshold"],
+        "next_rank": next_rank["name"] if next_rank else None,
+        "next_threshold": next_rank["threshold"] if next_rank else None,
+        "xp_to_next": max(0, (next_rank["threshold"] - xp)) if next_rank else 0,
+        "progress_to_next_percent": 100 if not next_rank else int(max(0, min(100, ((xp - current["threshold"]) / max(1, next_rank["threshold"] - current["threshold"])) * 100))),
+    }
+
+
+def calculate_stage(streak_days: int, verified_proofs_count: int, xp: Optional[int] = None) -> str:
+    """B2: rank is XP-based. The older signature is kept for compatibility."""
+    if xp is not None:
+        return rank_for_xp(int(xp or 0))["rank"]
+    # Compatibility fallback for older call sites.
+    if verified_proofs_count <= 0 and streak_days <= 0:
+        return "نگهبان"
+    return rank_for_xp(max(0, int(verified_proofs_count or 0) * DAILY_SUCCESS_XP))["rank"]
 
 
 
@@ -582,6 +604,54 @@ def parse_deadline_at(deadline: str, estimated_minutes: int = 30) -> datetime:
     return now + timedelta(minutes=max(1, int(estimated_minutes or 30)))
 
 
+def clamp_duration_days(value: Any) -> int:
+    try:
+        days = int(value or 1)
+    except Exception:
+        days = 1
+    return max(1, min(days, 365))
+
+
+def normalize_time_hhmm(value: str, fallback: str = "18:00") -> str:
+    raw = str(value or "").strip()
+    match = re.search(r"(\d{1,2})\s*:\s*(\d{2})", raw)
+    if not match:
+        return fallback
+    hour = max(0, min(23, int(match.group(1))))
+    minute = max(0, min(59, int(match.group(2))))
+    return f"{hour:02d}:{minute:02d}"
+
+
+def deadline_at_for_date(date_value: str, reminder_time: str) -> datetime:
+    hhmm = normalize_time_hhmm(reminder_time)
+    y, m, d = [int(x) for x in str(date_value).split("-")[:3]]
+    hour, minute = [int(x) for x in hhmm.split(":")]
+    return datetime(y, m, d, hour, minute, 0)
+
+
+def next_execution_date_from_task(task: Dict[str, Any], *, after_date: Optional[str] = None) -> str:
+    base = after_date or task.get("current_execution_date") or today_iso_date()
+    try:
+        return (datetime.fromisoformat(str(base)).date() + timedelta(days=1)).isoformat()
+    except Exception:
+        return (_utc_now().date() + timedelta(days=1)).isoformat()
+
+
+def schedule_for_execution_date(task: Dict[str, Any], execution_date: str) -> Dict[str, Any]:
+    deadline_raw = str(task.get("deadline") or "").strip()
+    # Test-mode relative deadlines (+3min) stay relative for the first schedule only.
+    if deadline_raw.startswith("+") and not task.get("deadline_at"):
+        deadline_at = parse_deadline_at(deadline_raw, int(task.get("estimated_minutes") or 30))
+    else:
+        reminder_time = task.get("reminder_time") or normalize_time_hhmm(deadline_raw, "18:00")
+        deadline_at = deadline_at_for_date(execution_date, reminder_time)
+        if deadline_at <= _utc_now():
+            deadline_at += timedelta(days=1)
+            execution_date = deadline_at.date().isoformat()
+    checkpoint_at = checkpoint_at_for(deadline_at, int(task.get("estimated_minutes") or 30))
+    return {"execution_date": execution_date, "deadline_at": _iso(deadline_at), "checkpoint_due_at": _iso(checkpoint_at)}
+
+
 def checkpoint_at_for(deadline_at: datetime, estimated_minutes: int = 30) -> datetime:
     now = _utc_now()
     remaining = max(1, int((deadline_at - now).total_seconds() // 60))
@@ -693,21 +763,41 @@ def initialize_task_followup_schedule(conn, task_row) -> Dict[str, Any]:
     task = row_to_dict(task_row) or {}
     if not task:
         return {}
-    estimated = int(task.get("estimated_minutes") or 30)
-    deadline_at = parse_deadline_at(task.get("deadline"), estimated)
-    checkpoint_at = checkpoint_at_for(deadline_at, estimated)
+    task.setdefault("duration_days", 1)
+    task.setdefault("reminder_time", normalize_time_hhmm(task.get("deadline") or "18:00"))
+    task.setdefault("contract_start_date", today_iso_date())
+    task.setdefault("current_execution_date", today_iso_date())
+    schedule = schedule_for_execution_date(task, task.get("current_execution_date") or today_iso_date())
+    end_date = task.get("contract_end_date")
+    if not end_date:
+        try:
+            end_date = (datetime.fromisoformat(str(task.get("contract_start_date") or today_iso_date())).date() + timedelta(days=clamp_duration_days(task.get("duration_days")) - 1)).isoformat()
+        except Exception:
+            end_date = (_utc_now().date() + timedelta(days=clamp_duration_days(task.get("duration_days")) - 1)).isoformat()
     conn.execute(
         """
         UPDATE tasks
         SET deadline_at = ?, checkpoint_due_at = ?, final_status = 'active',
             checkpoint_sent_at = NULL, deadline_prompt_sent_at = NULL,
             proof_requested_at = NULL, follow_up_at = NULL, follow_up_sent_at = NULL,
-            current_interaction_id = NULL, last_bot_event_at = ?, updated_at = ?
+            current_interaction_id = NULL, last_bot_event_at = ?, updated_at = ?,
+            duration_days = ?, reminder_time = ?, contract_start_date = COALESCE(contract_start_date, ?),
+            contract_end_date = COALESCE(contract_end_date, ?), current_execution_date = ?,
+            daily_xp_value = ?, egg_state = COALESCE(egg_state, 'healthy')
         WHERE id = ? AND telegram_id = ?
         """,
-        (_iso(deadline_at), _iso(checkpoint_at), now_iso(), now_iso(), task["id"], task["telegram_id"])
+        (
+            schedule["deadline_at"], schedule["checkpoint_due_at"], now_iso(), now_iso(),
+            clamp_duration_days(task.get("duration_days")),
+            task.get("reminder_time") or normalize_time_hhmm(task.get("deadline") or "18:00"),
+            task.get("contract_start_date") or today_iso_date(),
+            end_date,
+            schedule["execution_date"],
+            int(task.get("daily_xp_value") or DAILY_SUCCESS_XP),
+            task["id"], task["telegram_id"]
+        )
     )
-    return {"deadline_at": _iso(deadline_at), "checkpoint_due_at": _iso(checkpoint_at)}
+    return {"deadline_at": schedule["deadline_at"], "checkpoint_due_at": schedule["checkpoint_due_at"], "execution_date": schedule["execution_date"], "contract_end_date": end_date}
 
 
 def ensure_task_followup_schedule(conn, task_row) -> Dict[str, Any]:
@@ -976,16 +1066,9 @@ def handle_deadline_reply(conn, interaction, task, text: str) -> str:
         return open_proof_request(conn, task["telegram_id"], task, "deadline_done")
     if is_miss_text(low):
         close_bot_interaction(conn, interaction["id"], text)
-        create_bot_interaction(conn, task["telegram_id"], task["id"], "miss_cause", "free_text", {})
-        conn.execute(
-            """
-            UPDATE tasks
-            SET lifecycle_status = 'miss_recovery_started', final_status = 'missed_pending_recovery', last_bot_event_at = ?, updated_at = ?
-            WHERE id = ? AND telegram_id = ?
-            """,
-            (now_iso(), now_iso(), task["id"], task["telegram_id"])
-        )
-        return "چه چیزی باعث شد انجام نشود؟ یک جمله کوتاه بفرست."
+        mark_task_missed(conn, task, reason="user_reported_miss", auto=False)
+        return "تخم این قرارداد شکست؛ امروز انجام نشد و پیوستگی صفر شد. برای شروع دوباره، یک تعهد تازه بساز."
+
     if is_defer_text(low):
         new_deadline = _utc_now() + timedelta(days=1)
         new_checkpoint = checkpoint_at_for(new_deadline, int(task.get("estimated_minutes") or 30))
@@ -1151,9 +1234,141 @@ def handle_bot_execution_reply(telegram_id: str, text: str, first_name: str = "�
         return True
 
 
+def task_is_last_contract_day(task: Dict[str, Any]) -> bool:
+    try:
+        duration = clamp_duration_days(task.get("duration_days"))
+        successful = int(task.get("successful_days") or 0)
+        return successful + 1 >= duration
+    except Exception:
+        return True
+
+
+def reschedule_next_contract_day(conn, task: Dict[str, Any], *, lifecycle_status: str = "waiting_next_day") -> Dict[str, Any]:
+    next_date = next_execution_date_from_task(task)
+    schedule = schedule_for_execution_date(task, next_date)
+    conn.execute(
+        """
+        UPDATE tasks
+        SET status = 'active',
+            lifecycle_status = ?,
+            final_status = 'active',
+            current_execution_date = ?,
+            deadline_at = ?,
+            checkpoint_due_at = ?,
+            checkpoint_sent_at = NULL,
+            deadline_prompt_sent_at = NULL,
+            proof_requested_at = NULL,
+            follow_up_at = NULL,
+            follow_up_sent_at = NULL,
+            current_interaction_id = NULL,
+            updated_at = ?,
+            last_bot_event_at = ?
+        WHERE id = ? AND telegram_id = ?
+        """,
+        (
+            lifecycle_status,
+            schedule["execution_date"],
+            schedule["deadline_at"],
+            schedule["checkpoint_due_at"],
+            now_iso(),
+            now_iso(),
+            task["id"],
+            task["telegram_id"],
+        )
+    )
+    conn.execute(
+        """
+        UPDATE bot_interactions
+        SET status = 'closed', closed_at = ?, last_reply_text = 'next_day_rescheduled'
+        WHERE task_id = ? AND telegram_id = ? AND status = 'open'
+        """,
+        (now_iso(), task["id"], task["telegram_id"])
+    )
+    return schedule
+
+
+def mark_task_missed(conn, task, reason: str = "missed_day", auto: bool = False) -> Dict[str, Any]:
+    task = row_to_dict(task) or task
+    user = conn.execute("SELECT * FROM users WHERE telegram_id = ?", (task["telegram_id"],)).fetchone()
+    old_stage = user["guardian_stage"] if user else "نگهبان"
+    old_xp = int(user["xp"] if user else 0)
+    new_stage = rank_for_xp(old_xp)["rank"]
+    missed_at = now_iso()
+    conn.execute(
+        """
+        UPDATE users
+        SET streak_days = 0, guardian_stage = ?, updated_at = ?
+        WHERE telegram_id = ?
+        """,
+        (new_stage, missed_at, task["telegram_id"])
+    )
+    conn.execute(
+        """
+        UPDATE tasks
+        SET status = 'failed',
+            lifecycle_status = ?,
+            final_status = 'failed',
+            egg_state = 'broken',
+            missed_days = missed_days + 1,
+            last_miss_date = ?,
+            current_interaction_id = NULL,
+            closed_at = ?,
+            close_reason = ?,
+            updated_at = ?,
+            last_bot_event_at = ?
+        WHERE id = ? AND telegram_id = ?
+        """,
+        ("auto_missed" if auto else "missed", today_iso_date(), missed_at, reason, missed_at, missed_at, task["id"], task["telegram_id"])
+    )
+    conn.execute(
+        """
+        UPDATE bot_interactions
+        SET status = 'closed', closed_at = ?, last_reply_text = ?
+        WHERE task_id = ? AND telegram_id = ? AND status = 'open'
+        """,
+        (missed_at, reason, task["id"], task["telegram_id"])
+    )
+    conn.execute(
+        """
+        INSERT INTO progression_events (telegram_id, event_type, xp_delta, old_stage, new_stage, metadata, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (task["telegram_id"], "contract_missed", 0, old_stage, new_stage, f"task_id={task['id']};reason={reason};streak_reset=true;egg_state=broken", missed_at)
+    )
+    return {"ok": True, "streak_reset": True, "egg_state": "broken", "reason": reason}
+
+
+def auto_mark_expired_tasks(conn, limit: int = 25) -> int:
+    cutoff = _iso(_utc_now() - timedelta(minutes=max(1, AUTO_MISS_GRACE_MINUTES)))
+    rows = conn.execute(
+        """
+        SELECT * FROM tasks
+        WHERE status = 'active'
+          AND deadline_at IS NOT NULL
+          AND deadline_at <= ?
+          AND deadline_prompt_sent_at IS NOT NULL
+          AND completed_at IS NULL
+          AND proof_requested_at IS NULL
+        ORDER BY deadline_at ASC
+        LIMIT ?
+        """,
+        (cutoff, limit)
+    ).fetchall()
+    count = 0
+    for task in rows:
+        try:
+            mark_task_missed(conn, task, reason="deadline_expired_without_done", auto=True)
+            conn.commit()
+            send_bot_message_logged(str(task["telegram_id"]), "تخم این قرارداد شکست؛ امروز انجام نشد و پیوستگی صفر شد. برای شروع دوباره، یک تعهد تازه بساز.", task["id"], "auto_missed")
+            count += 1
+        except Exception:
+            conn.rollback()
+    return count
+
+
 def process_due_execution_loop(limit: int = 25) -> Dict[str, Any]:
     now = _iso(_utc_now())
-    processed = {"checkpoint": 0, "deadline": 0, "recovery_followup": 0, "backfilled": 0}
+    processed = {"checkpoint": 0, "deadline": 0, "recovery_followup": 0, "backfilled": 0, "auto_missed": 0}
     messages = []
 
     def _send_due(conn, task, kind: str, message_text: str, interaction_type: str, expected_reply_type: str, sent_column: str, lifecycle_status: str) -> bool:
@@ -1171,6 +1386,7 @@ def process_due_execution_loop(limit: int = 25) -> Dict[str, Any]:
 
     with get_db() as conn:
         processed["backfilled"] = backfill_missing_followup_schedules(conn, limit=max(limit * 2, 25))
+        processed["auto_missed"] = auto_mark_expired_tasks(conn, limit=max(limit, 25))
         checkpoint_rows = conn.execute(
             """
             SELECT * FROM tasks
@@ -1420,7 +1636,7 @@ def apply_review_award(
     streak_delta = 0 if prior_accepted_today else 1
     new_streak = int(user["streak_days"]) + streak_delta
     new_verified_count = int(user["verified_proofs_count"]) + 1
-    new_stage = calculate_stage(new_streak, new_verified_count)
+    new_stage = calculate_stage(new_streak, new_verified_count, xp=new_xp)
     reviewed_at = now_iso()
 
     conn.execute(
@@ -1863,6 +2079,20 @@ def init_db():
         ensure_column(conn, "proofs", "awarded_after_review", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "proofs", "witness_status", "TEXT NOT NULL DEFAULT 'none'")
         ensure_column(conn, "proofs", "witness_confirmed_count", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "proofs", "execution_date", "TEXT")
+
+        # B2 product lifecycle fields: recurring daily contract, clean XP/streak/rank, egg state.
+        ensure_column(conn, "tasks", "duration_days", "INTEGER NOT NULL DEFAULT 1")
+        ensure_column(conn, "tasks", "reminder_time", "TEXT")
+        ensure_column(conn, "tasks", "contract_start_date", "TEXT")
+        ensure_column(conn, "tasks", "contract_end_date", "TEXT")
+        ensure_column(conn, "tasks", "current_execution_date", "TEXT")
+        ensure_column(conn, "tasks", "successful_days", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "tasks", "missed_days", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "tasks", "daily_xp_value", "INTEGER NOT NULL DEFAULT 5")
+        ensure_column(conn, "tasks", "egg_state", "TEXT NOT NULL DEFAULT 'healthy'")
+        ensure_column(conn, "tasks", "last_success_date", "TEXT")
+        ensure_column(conn, "tasks", "last_miss_date", "TEXT")
 
         # B1 execution follow-up loop fields.
         ensure_column(conn, "tasks", "deadline_at", "TEXT")
@@ -1958,6 +2188,8 @@ class TaskCreateRequest(BaseModel):
     title: str
     deadline: str = "18:00"
     proof_type: str = "متن یا لینک"
+    duration_days: int = 1
+    reminder_time: Optional[str] = None
 
     # Contract Core V1
     done_definition: Optional[str] = None
@@ -2038,7 +2270,7 @@ def root():
         "database": DB_PATH,
         "db_backend": DB_BACKEND,
         "database_url_configured": bool(DATABASE_URL),
-        "version": "0.15.1-b1o-deploy-gates-v1"
+        "version": "0.16.1-b2a-contract-lifecycle-fixes-v1"
     }
 
 
@@ -2051,7 +2283,7 @@ def health():
         "db_backend": DB_BACKEND,
         "database_url_configured": bool(DATABASE_URL),
         "bot_token_configured": bool(BOT_TOKEN),
-        "version": "0.15.1-b1o-deploy-gates-v1"
+        "version": "0.16.1-b2a-contract-lifecycle-fixes-v1"
     }
 
 
@@ -2466,7 +2698,7 @@ def handle_bot_command(chat_id: str, command: str, first_name: str = "کاربر
 def features():
     return {
         "ok": True,
-        "version": "0.15.1-b1o-deploy-gates-v1",
+        "version": "0.16.1-b2a-contract-lifecycle-fixes-v1",
         "bot_command_version": BOT_COMMAND_VERSION,
         "features": [
             "contract_core",
@@ -2686,6 +2918,8 @@ def ensure_user_exists(conn: sqlite3.Connection, telegram_id: str, first_name: s
 def normalize_contract_payload(data: TaskCreateRequest) -> Dict[str, Any]:
     title = data.title.strip()
     deadline = data.deadline.strip() or "18:00"
+    reminder_time = normalize_time_hhmm(data.reminder_time or deadline, "18:00")
+    duration_days = clamp_duration_days(data.duration_days)
     proof_type = data.proof_type.strip() or "متن یا لینک"
 
     done_definition = (data.done_definition or "").strip()
@@ -2712,6 +2946,8 @@ def normalize_contract_payload(data: TaskCreateRequest) -> Dict[str, Any]:
     return {
         "title": title,
         "deadline": deadline,
+        "reminder_time": reminder_time,
+        "duration_days": duration_days,
         "proof_type": proof_type,
         "normalized_proof_type": normalize_proof_type(proof_type),
         "done_definition": done_definition,
@@ -3114,9 +3350,11 @@ def create_contract_record(data: TaskCreateRequest):
                 done_definition, if_then_trigger, if_then_action, micro_fallback,
                 estimated_minutes, contract_type, difficulty, source,
                 normalized_proof_type, contract_quality_score, predicted_risk, validation_status, validation_notes, validation_version,
-                execution_date, lifecycle_status, lifecycle_version
+                execution_date, lifecycle_status, lifecycle_version,
+                duration_days, reminder_time, contract_start_date, contract_end_date, current_execution_date,
+                successful_days, missed_days, daily_xp_value, egg_state
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 telegram_id,
@@ -3142,7 +3380,16 @@ def create_contract_record(data: TaskCreateRequest):
                 validation["validation_version"],
                 today_iso_date(),
                 "active",
-                DAILY_LIFECYCLE_VERSION
+                DAILY_LIFECYCLE_VERSION,
+                contract["duration_days"],
+                contract["reminder_time"],
+                today_iso_date(),
+                (_utc_now().date() + timedelta(days=contract["duration_days"] - 1)).isoformat(),
+                today_iso_date(),
+                0,
+                0,
+                DAILY_SUCCESS_XP,
+                "healthy"
             )
         )
         new_task_id = cursor.lastrowid
@@ -3447,6 +3694,70 @@ def bot_cron_status(
         "freshness": freshness,
         "cron_token_configured": bool(BOT_CRON_TOKEN or BOT_TICK_TOKEN),
         "bot_token_configured": bool(BOT_TOKEN)
+    }
+
+
+@app.post("/ops/reset-user")
+def ops_reset_user(
+    telegram_id: str,
+    token: Optional[str] = None,
+    x_bot_tick_token: Optional[str] = Header(None, alias="X-Bot-Tick-Token")
+):
+    """Protected test utility: full reset for one Telegram user before 3-person QA.
+
+    B2A: resets XP/streak/rank to zero state and removes old contracts, proofs,
+    bot interactions, notification logs, team memberships, owned teams and related audit rows.
+    """
+    validate_bot_tick_token(token, x_bot_tick_token)
+    telegram_id = str(telegram_id or "").strip()
+    if not telegram_id:
+        raise HTTPException(status_code=400, detail="telegram_id الزامی است")
+
+    deleted = {}
+    def _exec_count(conn, label: str, sql: str, params=()):
+        try:
+            conn.execute(sql, params)
+            deleted[label] = deleted.get(label, 0) + 1
+        except Exception as exc:
+            deleted[label + "_error"] = str(exc)
+
+    with get_db() as conn:
+        # Close/open references first. Use subqueries too so rows tied to this user's tasks/proofs are removed.
+        _exec_count(conn, "bot_interactions", "DELETE FROM bot_interactions WHERE telegram_id = ? OR task_id IN (SELECT id FROM tasks WHERE telegram_id = ?)", (telegram_id, telegram_id))
+        _exec_count(conn, "bot_notifications_log", "DELETE FROM bot_notifications_log WHERE telegram_id = ? OR task_id IN (SELECT id FROM tasks WHERE telegram_id = ?)", (telegram_id, telegram_id))
+        _exec_count(conn, "witness_requests", "DELETE FROM witness_requests WHERE telegram_id = ? OR witness_telegram_id = ? OR task_id IN (SELECT id FROM tasks WHERE telegram_id = ?) OR proof_id IN (SELECT id FROM proofs WHERE telegram_id = ?)", (telegram_id, telegram_id, telegram_id, telegram_id))
+        _exec_count(conn, "proof_appeals", "DELETE FROM proof_appeals WHERE telegram_id = ? OR task_id IN (SELECT id FROM tasks WHERE telegram_id = ?) OR proof_id IN (SELECT id FROM proofs WHERE telegram_id = ?)", (telegram_id, telegram_id, telegram_id))
+        _exec_count(conn, "proofs", "DELETE FROM proofs WHERE telegram_id = ? OR task_id IN (SELECT id FROM tasks WHERE telegram_id = ?)", (telegram_id, telegram_id))
+        _exec_count(conn, "progression_events", "DELETE FROM progression_events WHERE telegram_id = ?", (telegram_id,))
+        _exec_count(conn, "team_members_owned", "DELETE FROM team_members WHERE team_id IN (SELECT id FROM teams WHERE owner_telegram_id = ?)", (telegram_id,))
+        _exec_count(conn, "team_members", "DELETE FROM team_members WHERE telegram_id = ?", (telegram_id,))
+        _exec_count(conn, "teams", "DELETE FROM teams WHERE owner_telegram_id = ?", (telegram_id,))
+        _exec_count(conn, "tasks", "DELETE FROM tasks WHERE telegram_id = ?", (telegram_id,))
+        _exec_count(conn, "users", "DELETE FROM users WHERE telegram_id = ?", (telegram_id,))
+
+        created = now_iso()
+        conn.execute(
+            """
+            INSERT INTO users (telegram_id, first_name, username, xp, streak_days, guardian_stage, verified_proofs_count, created_at, updated_at)
+            VALUES (?, ?, ?, 0, 0, 'نگهبان', 0, ?, ?)
+            """,
+            (telegram_id, "کاربر", None, created, created)
+        )
+        conn.commit()
+
+        clean_user = conn.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)).fetchone()
+        remaining_tasks = conn.execute("SELECT COUNT(*) AS count FROM tasks WHERE telegram_id = ?", (telegram_id,)).fetchone()["count"]
+        remaining_proofs = conn.execute("SELECT COUNT(*) AS count FROM proofs WHERE telegram_id = ?", (telegram_id,)).fetchone()["count"]
+
+    return {
+        "ok": True,
+        "version": "0.16.1-b2a-contract-lifecycle-fixes-v1",
+        "telegram_id": telegram_id,
+        "message": "کاربر برای تست تمیز شد.",
+        "deleted": deleted,
+        "remaining": {"tasks": remaining_tasks, "proofs": remaining_proofs},
+        "progress": {"xp": 0, "streak_days": 0, "guardian_stage": "نگهبان", "verified_proofs_count": 0},
+        "user": row_to_dict(clean_user)
     }
 
 
@@ -3846,10 +4157,13 @@ def create_proof(data: ProofCreateRequest):
 
         created = now_iso()
 
+        proof_execution_date = task["current_execution_date"] if "current_execution_date" in task.keys() and task["current_execution_date"] else today_iso_date()
+
         existing_proof = conn.execute(
             """
             SELECT * FROM proofs
             WHERE telegram_id = ? AND task_id = ?
+              AND execution_date = ?
               AND review_status IN (
                 'auto_accepted', 'accepted', 'accepted_after_appeal',
                 'needs_review', 'duplicate_submission'
@@ -3857,7 +4171,7 @@ def create_proof(data: ProofCreateRequest):
             ORDER BY id ASC
             LIMIT 1
             """,
-            (telegram_id, data.task_id)
+            (telegram_id, data.task_id, proof_execution_date)
         ).fetchone()
 
         user = conn.execute(
@@ -3923,7 +4237,8 @@ def create_proof(data: ProofCreateRequest):
         else:
             proof_validation = evaluate_proof_quality(proof_text, task)
             needs_review = proof_validation["review_status"] == "needs_review"
-            xp_awarded = 0 if needs_review else proof_validation["xp_awarded"]
+            xp_awarded = 0 if needs_review else int(task["daily_xp_value"] if "daily_xp_value" in task.keys() and task["daily_xp_value"] is not None else DAILY_SUCCESS_XP)
+            proof_validation["xp_awarded"] = xp_awarded
             review_priority = calculate_review_priority(proof_validation, task)
 
             cursor = conn.execute(
@@ -3934,9 +4249,9 @@ def create_proof(data: ProofCreateRequest):
                     proof_kind, proof_quality_score, proof_risk,
                     proof_validation_status, proof_validation_notes, proof_validation_version,
                     detected_links, word_count, integrity_flag, duplicate_of_proof_id, integrity_version,
-                    review_priority, review_version, awarded_after_review
+                    review_priority, review_version, awarded_after_review, execution_date
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     telegram_id,
@@ -3961,6 +4276,7 @@ def create_proof(data: ProofCreateRequest):
                     review_priority,
                     REVIEW_APPEAL_VERSION,
                     0,
+                    proof_execution_date,
                 )
             )
 
@@ -4020,7 +4336,7 @@ def create_proof(data: ProofCreateRequest):
                 proof_validation["streak_delta"] = streak_delta
                 new_streak = int(user["streak_days"]) + streak_delta
                 new_verified_count = int(user["verified_proofs_count"]) + 1
-                new_stage = calculate_stage(new_streak, new_verified_count)
+                new_stage = calculate_stage(new_streak, new_verified_count, xp=new_xp)
 
                 conn.execute(
                     """
@@ -4039,23 +4355,52 @@ def create_proof(data: ProofCreateRequest):
                     )
                 )
 
-                conn.execute(
-                    """
-                    UPDATE tasks
-                    SET status = 'completed',
-                        lifecycle_status = 'completed',
-                        final_status = 'completed',
-                        current_interaction_id = NULL,
-                        submitted_at = ?,
-                        completed_at = ?,
-                        proof_attempts_count = proof_attempts_count + 1,
-                        integrity_status = 'completed_once',
-                        lifecycle_version = ?,
-                        updated_at = ?
-                    WHERE id = ? AND telegram_id = ?
-                    """,
-                    (created, created, DAILY_LIFECYCLE_VERSION, now_iso(), data.task_id, telegram_id)
-                )
+                task_dict_for_schedule = row_to_dict(task) or {}
+                task_dict_for_schedule["successful_days"] = int(task_dict_for_schedule.get("successful_days") or 0)
+                last_day = task_is_last_contract_day(task_dict_for_schedule)
+                if last_day:
+                    conn.execute(
+                        """
+                        UPDATE tasks
+                        SET status = 'completed',
+                            lifecycle_status = 'completed',
+                            final_status = 'completed',
+                            egg_state = 'lion_born',
+                            current_interaction_id = NULL,
+                            submitted_at = ?,
+                            completed_at = ?,
+                            successful_days = successful_days + 1,
+                            last_success_date = ?,
+                            proof_attempts_count = proof_attempts_count + 1,
+                            integrity_status = 'completed_once',
+                            lifecycle_version = ?,
+                            updated_at = ?
+                        WHERE id = ? AND telegram_id = ?
+                        """,
+                        (created, created, today_iso_date(), DAILY_LIFECYCLE_VERSION, now_iso(), data.task_id, telegram_id)
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE tasks
+                        SET status = 'active',
+                            lifecycle_status = 'day_completed_waiting_next',
+                            final_status = 'active',
+                            egg_state = 'cracked',
+                            current_interaction_id = NULL,
+                            submitted_at = ?,
+                            successful_days = successful_days + 1,
+                            last_success_date = ?,
+                            proof_attempts_count = proof_attempts_count + 1,
+                            integrity_status = 'daily_success_recorded',
+                            lifecycle_version = ?,
+                            updated_at = ?
+                        WHERE id = ? AND telegram_id = ?
+                        """,
+                        (created, today_iso_date(), DAILY_LIFECYCLE_VERSION, now_iso(), data.task_id, telegram_id)
+                    )
+                    refreshed_for_next = conn.execute("SELECT * FROM tasks WHERE id = ?", (data.task_id,)).fetchone()
+                    reschedule_next_contract_day(conn, row_to_dict(refreshed_for_next), lifecycle_status="waiting_next_day")
 
                 conn.execute(
                     """
@@ -4151,13 +4496,20 @@ def get_progress(telegram_id: str):
             "message": "کاربر هنوز ساخته نشده است"
         }
 
+    rank = rank_for_xp(user["xp"])
     return {
         "ok": True,
         "progress": {
             "xp": user["xp"],
             "streak_days": user["streak_days"],
-            "guardian_stage": user["guardian_stage"],
-            "verified_proofs_count": user["verified_proofs_count"]
+            "guardian_stage": rank["rank"],
+            "verified_proofs_count": user["verified_proofs_count"],
+            "rank": rank["rank"],
+            "next_rank": rank["next_rank"],
+            "next_threshold": rank["next_threshold"],
+            "xp_to_next": rank["xp_to_next"],
+            "rank_progress_percent": rank["progress_to_next_percent"],
+            "daily_success_xp": DAILY_SUCCESS_XP
         }
     }
 
