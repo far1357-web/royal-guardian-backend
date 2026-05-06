@@ -32,7 +32,7 @@ REVIEW_APPEAL_VERSION = "v36c-review-appeal-lite-1"
 DASHBOARD_TIMELINE_VERSION = "v36c-dashboard-timeline-lite-1"
 TEAM_WITNESS_VERSION = "v36c-team-witness-lite-1"
 BOT_COMMAND_VERSION = "v36c-bot-command-center-lite-1"
-B1_EXECUTION_LOOP_VERSION = "b2-contract-lifecycle-v1"
+B1_EXECUTION_LOOP_VERSION = "b2b-product-stabilization-v1"
 BOT_TICK_TOKEN = os.getenv("BOT_TICK_TOKEN", "").strip()
 BOT_CRON_TOKEN = os.getenv("BOT_CRON_TOKEN", "").strip()
 BOT_CRON_LOCK_SECONDS = int(os.getenv("BOT_CRON_LOCK_SECONDS", "120") or "120")
@@ -79,7 +79,7 @@ AMBIGUOUS_PREFIXES = (
 
 app = FastAPI(
     title="Royal Guardian Backend",
-    version="0.16.1-b2a-contract-lifecycle-fixes-v1"
+    version="0.16.2-b2b-product-stabilization-v1"
 )
 
 app.add_middleware(
@@ -502,15 +502,9 @@ def evaluate_proof_quality(proof_text: str, task: sqlite3.Row) -> Dict[str, Any]
         review_status = "needs_review"
         proof_risk = "high"
 
-    if review_status == "auto_accepted":
-        if score >= 85:
-            xp_awarded = 35
-        elif score >= 70:
-            xp_awarded = 25
-        else:
-            xp_awarded = 15
-    else:
-        xp_awarded = 5
+    # Product rule B2B: each successful contract day grants exactly DAILY_SUCCESS_XP.
+    # Proof quality still drives review/validation, not variable XP inflation.
+    xp_awarded = DAILY_SUCCESS_XP if review_status == "auto_accepted" else 0
 
     notes = []
     if errors:
@@ -2270,7 +2264,7 @@ def root():
         "database": DB_PATH,
         "db_backend": DB_BACKEND,
         "database_url_configured": bool(DATABASE_URL),
-        "version": "0.16.1-b2a-contract-lifecycle-fixes-v1"
+        "version": "0.16.2-b2b-product-stabilization-v1"
     }
 
 
@@ -2283,7 +2277,7 @@ def health():
         "db_backend": DB_BACKEND,
         "database_url_configured": bool(DATABASE_URL),
         "bot_token_configured": bool(BOT_TOKEN),
-        "version": "0.16.1-b2a-contract-lifecycle-fixes-v1"
+        "version": "0.16.2-b2b-product-stabilization-v1"
     }
 
 
@@ -2698,7 +2692,7 @@ def handle_bot_command(chat_id: str, command: str, first_name: str = "کاربر
 def features():
     return {
         "ok": True,
-        "version": "0.16.1-b2a-contract-lifecycle-fixes-v1",
+        "version": "0.16.2-b2b-product-stabilization-v1",
         "bot_command_version": BOT_COMMAND_VERSION,
         "features": [
             "contract_core",
@@ -3697,6 +3691,7 @@ def bot_cron_status(
     }
 
 
+@app.get("/ops/reset-user")
 @app.post("/ops/reset-user")
 def ops_reset_user(
     telegram_id: str,
@@ -3705,7 +3700,7 @@ def ops_reset_user(
 ):
     """Protected test utility: full reset for one Telegram user before 3-person QA.
 
-    B2A: resets XP/streak/rank to zero state and removes old contracts, proofs,
+    B2B: resets XP/streak/rank to zero state and removes old contracts, proofs,
     bot interactions, notification logs, team memberships, owned teams and related audit rows.
     """
     validate_bot_tick_token(token, x_bot_tick_token)
@@ -3751,12 +3746,13 @@ def ops_reset_user(
 
     return {
         "ok": True,
-        "version": "0.16.1-b2a-contract-lifecycle-fixes-v1",
+        "version": "0.16.2-b2b-product-stabilization-v1",
         "telegram_id": telegram_id,
         "message": "کاربر برای تست تمیز شد.",
         "deleted": deleted,
         "remaining": {"tasks": remaining_tasks, "proofs": remaining_proofs},
-        "progress": {"xp": 0, "streak_days": 0, "guardian_stage": "نگهبان", "verified_proofs_count": 0},
+        "progress": {"xp": 0, "streak_days": 0, "guardian_stage": "نگهبان", "rank": "نگهبان", "verified_proofs_count": 0},
+        "rank": rank_for_xp(0),
         "user": row_to_dict(clean_user)
     }
 
@@ -4158,6 +4154,11 @@ def create_proof(data: ProofCreateRequest):
         created = now_iso()
 
         proof_execution_date = task["current_execution_date"] if "current_execution_date" in task.keys() and task["current_execution_date"] else today_iso_date()
+        if str(proof_execution_date) > today_iso_date():
+            raise HTTPException(
+                status_code=409,
+                detail="اثبات روز بعد هنوز شروع نشده است. در زمان یادآوری بعدی دوباره ثبت کن."
+            )
 
         existing_proof = conn.execute(
             """
