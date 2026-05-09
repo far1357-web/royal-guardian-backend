@@ -32,7 +32,7 @@ REVIEW_APPEAL_VERSION = "v36c-review-appeal-lite-1"
 DASHBOARD_TIMELINE_VERSION = "v36c-dashboard-timeline-lite-1"
 TEAM_WITNESS_VERSION = "v36c-team-witness-lite-1"
 BOT_COMMAND_VERSION = "v36c-bot-command-center-lite-1"
-B1_EXECUTION_LOOP_VERSION = "b2b-product-stabilization-v1"
+B1_EXECUTION_LOOP_VERSION = "b2c-design-lock-stabilization-v1"
 BOT_TICK_TOKEN = os.getenv("BOT_TICK_TOKEN", "").strip()
 BOT_CRON_TOKEN = os.getenv("BOT_CRON_TOKEN", "").strip()
 BOT_CRON_LOCK_SECONDS = int(os.getenv("BOT_CRON_LOCK_SECONDS", "120") or "120")
@@ -79,7 +79,7 @@ AMBIGUOUS_PREFIXES = (
 
 app = FastAPI(
     title="Royal Guardian Backend",
-    version="0.16.2-b2b-product-stabilization-v1"
+    version="0.16.3-b2c-design-lock-stabilization-v1"
 )
 
 app.add_middleware(
@@ -2184,6 +2184,7 @@ class TaskCreateRequest(BaseModel):
     proof_type: str = "متن یا لینک"
     duration_days: int = 1
     reminder_time: Optional[str] = None
+    replace_active: bool = False
 
     # Contract Core V1
     done_definition: Optional[str] = None
@@ -2264,7 +2265,7 @@ def root():
         "database": DB_PATH,
         "db_backend": DB_BACKEND,
         "database_url_configured": bool(DATABASE_URL),
-        "version": "0.16.2-b2b-product-stabilization-v1"
+        "version": "0.16.3-b2c-design-lock-stabilization-v1"
     }
 
 
@@ -2277,7 +2278,7 @@ def health():
         "db_backend": DB_BACKEND,
         "database_url_configured": bool(DATABASE_URL),
         "bot_token_configured": bool(BOT_TOKEN),
-        "version": "0.16.2-b2b-product-stabilization-v1"
+        "version": "0.16.3-b2c-design-lock-stabilization-v1"
     }
 
 
@@ -2692,7 +2693,7 @@ def handle_bot_command(chat_id: str, command: str, first_name: str = "کاربر
 def features():
     return {
         "ok": True,
-        "version": "0.16.2-b2b-product-stabilization-v1",
+        "version": "0.16.3-b2c-design-lock-stabilization-v1",
         "bot_command_version": BOT_COMMAND_VERSION,
         "features": [
             "contract_core",
@@ -2896,7 +2897,7 @@ def ensure_user_exists(conn: sqlite3.Connection, telegram_id: str, first_name: s
                 username,
                 0,
                 0,
-                "هسته خاموش",
+                "نگهبان",
                 0,
                 created,
                 created
@@ -3334,7 +3335,29 @@ def create_contract_record(data: TaskCreateRequest):
 
     with get_db() as conn:
         ensure_user_exists(conn, telegram_id)
-        close_previous_active_contracts(conn, telegram_id)
+
+        active_existing = conn.execute(
+            """
+            SELECT id, title FROM tasks
+            WHERE telegram_id = ? AND status = 'active'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (telegram_id,)
+        ).fetchone()
+
+        if active_existing is not None and not data.replace_active:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "active_contract_exists",
+                    "message": "یک تعهد فعال داری. اول همان را کامل، حذف یا لغو کن؛ بعد تعهد تازه بساز.",
+                    "active_contract": row_to_dict(active_existing),
+                }
+            )
+
+        if active_existing is not None and data.replace_active:
+            close_previous_active_contracts(conn, telegram_id)
 
         created = now_iso()
         cursor = conn.execute(
@@ -3746,7 +3769,7 @@ def ops_reset_user(
 
     return {
         "ok": True,
-        "version": "0.16.2-b2b-product-stabilization-v1",
+        "version": "0.16.3-b2c-design-lock-stabilization-v1",
         "telegram_id": telegram_id,
         "message": "کاربر برای تست تمیز شد.",
         "deleted": deleted,
@@ -3984,17 +4007,8 @@ def get_today(telegram_id: str):
             (telegram_id,)
         ).fetchone()
 
-        if task is None:
-            task = conn.execute(
-                """
-                SELECT * FROM tasks
-                WHERE telegram_id = ?
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (telegram_id,)
-            ).fetchone()
-
+        # B2C: /today is strictly the active commitment view. Completed/old
+        # contracts remain in history only and must not pollute the active screen.
         if task is None and AUTO_SEED_DEFAULT_TASK:
             created = now_iso()
             cursor = conn.execute(
@@ -4486,16 +4500,11 @@ def get_progress(telegram_id: str):
         raise HTTPException(status_code=400, detail="شناسه تلگرام الزامی است")
 
     with get_db() as conn:
+        ensure_user_exists(conn, telegram_id)
         user = conn.execute(
             "SELECT * FROM users WHERE telegram_id = ?",
             (telegram_id,)
         ).fetchone()
-
-    if user is None:
-        return {
-            "ok": False,
-            "message": "کاربر هنوز ساخته نشده است"
-        }
 
     rank = rank_for_xp(user["xp"])
     return {
@@ -4533,17 +4542,8 @@ def lifecycle_today(telegram_id: str):
             (telegram_id,)
         ).fetchone()
 
-        if task is None:
-            task = conn.execute(
-                """
-                SELECT * FROM tasks
-                WHERE telegram_id = ?
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (telegram_id,)
-            ).fetchone()
-
+        # B2C: do not show latest historical contract as current lifecycle.
+        # No active contract means no current contract.
         lifecycle = build_task_lifecycle(conn, task)
 
         user = conn.execute(
@@ -4625,6 +4625,55 @@ def contracts_history(telegram_id: str, limit: int = 20):
     return {
         "ok": True,
         "contracts": [row_to_dict(row) for row in rows]
+    }
+
+
+@app.delete("/contracts/{task_id}")
+@app.post("/contracts/{task_id}/delete")
+def delete_contract_for_user(task_id: int, telegram_id: str):
+    """User-facing deletion for history cleanup.
+
+    B2C rule: a user may delete only their own commitment. Related proofs and
+    bot interactions are removed so old test data cannot keep leaking into the
+    UI. This is intentionally not an admin/debug endpoint.
+    """
+    telegram_id = str(telegram_id or "").strip()
+    if not telegram_id:
+        raise HTTPException(status_code=400, detail="شناسه تلگرام الزامی است")
+
+    with get_db() as conn:
+        task = conn.execute(
+            "SELECT * FROM tasks WHERE id = ? AND telegram_id = ?",
+            (task_id, telegram_id)
+        ).fetchone()
+
+        if task is None:
+            raise HTTPException(status_code=404, detail="تعهد پیدا نشد")
+
+        deleted = {}
+
+        def _delete(label: str, sql: str, params=()):
+            try:
+                cur = conn.execute(sql, params)
+                deleted[label] = getattr(cur, "rowcount", None)
+            except Exception as exc:
+                deleted[label + "_error"] = str(exc)
+
+        _delete("bot_interactions", "DELETE FROM bot_interactions WHERE task_id = ? AND telegram_id = ?", (task_id, telegram_id))
+        _delete("bot_notifications_log", "DELETE FROM bot_notifications_log WHERE task_id = ? AND telegram_id = ?", (task_id, telegram_id))
+        _delete("witness_requests", "DELETE FROM witness_requests WHERE task_id = ? OR proof_id IN (SELECT id FROM proofs WHERE task_id = ? AND telegram_id = ?)", (task_id, task_id, telegram_id))
+        _delete("proof_appeals", "DELETE FROM proof_appeals WHERE task_id = ? OR proof_id IN (SELECT id FROM proofs WHERE task_id = ? AND telegram_id = ?)", (task_id, task_id, telegram_id))
+        _delete("proofs", "DELETE FROM proofs WHERE task_id = ? AND telegram_id = ?", (task_id, telegram_id))
+        _delete("progression_events", "DELETE FROM progression_events WHERE telegram_id = ? AND metadata LIKE ?", (telegram_id, f"%task_id={task_id}%"))
+        _delete("tasks", "DELETE FROM tasks WHERE id = ? AND telegram_id = ?", (task_id, telegram_id))
+        conn.commit()
+
+    return {
+        "ok": True,
+        "version": "0.16.3-b2c-design-lock-stabilization-v1",
+        "message": "تعهد حذف شد.",
+        "deleted": deleted,
+        "task_id": task_id,
     }
 
 
